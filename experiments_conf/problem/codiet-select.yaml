@@ -1,0 +1,24 @@
+name: codiet-select
+target: 'cholesterol'
+data_path: 'data/codiet-select'
+regularization: '01' #  either 00 > lambda = 0.0 or 01 > lambda = 0.1
+# file is already normalized
+normalize: false
+
+
+features: #null
+  - protein
+  - weight-control
+  - hba1c
+#  - cholesterol
+  - serving-size
+  - starch
+  - vitamin-d
+  - dopamine,
+  - serotonin
+  - caffeine
+  - calcium
+  - glucose
+  - zinc
+  - magnesium
+  - fruit

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 from hydra.core.hydra_config import HydraConfig
 
 from data_helper import load_all_data
@@ -51,6 +52,17 @@ def start_experiment(cfg: DictConfig) -> None:
             s = Path('./data/intra_nodes.txt').read_text(encoding="utf-8").strip()
             mlflow.log_text(s, 'intra_nodes.txt')
             row_and_col_names = ast.literal_eval(s) #[x.strip() for x in s.strip("[]").split(",")]
+
+        if cfg.problem.name == "codiet-select":
+            prep_data = pd.read_feather(join(cfg.problem.data_path, "features.feather"))
+            prep_data = prep_data.select_dtypes(include=["number"])
+            row_and_col_names = prep_data.columns
+            with zipfile.ZipFile(join(cfg.problem.data_path, "W_est.csv.zip")) as z:
+                with z.open(f"W_est_{cfg.problem.regularization}.csv") as f:
+                    df = pd.read_csv(f, index_col=0, header=0)
+                    # test that both data frames have the same index!
+                    pd.testing.assert_index_equal(prep_data.columns, df.columns)
+                    w_est = df.to_numpy()
 
         if cfg.problem.name == "cds":
             import cds_utils
