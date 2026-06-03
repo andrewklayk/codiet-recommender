@@ -1,0 +1,27 @@
+name: discrete
+model_name: DISC
+custom_objective: none
+#N_SELECT_FEATURES: 5
+n_runs: 5
+recalculate_dag: false
+
+#feature_selector: SequentialFeatureSelector
+
+# neural network architecture
+hidden_dim: 64
+n_layers: 2
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# constrained training via humancompatible/train (pip install humancompatible-train)
+# set use_alm: true and wire up constraints_fn in code to activate
+use_alm: false
+n_constraints: 1
+alm_lr: 0.1
+alm_momentum: 0.5
+
+# debugging
+debug: false

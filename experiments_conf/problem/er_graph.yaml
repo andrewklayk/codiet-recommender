@@ -1,0 +1,27 @@
+name: er_graph
+seed: 42
+
+# DAG structure
+d: 10          # number of nodes
+s0: 15         # expected number of edges
+graph_type: ER # ER, SF, BP, PATH, PATHPERM, G2
+
+# discrete CPT parameters
+n_values: 3        # number of discrete values per variable
+dominant_prob: 0.8 # probability mass on the most likely outcome per parent config
+
+# sampling
+n_samples: 1000
+
+target: 'X0'
+
+features:
+  - X1
+  - X2
+  - X3
+  - X4
+  - X5
+  - X6
+  - X7
+  - X8
+  - X9

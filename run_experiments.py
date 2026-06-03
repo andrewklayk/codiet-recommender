@@ -64,6 +64,23 @@ def start_experiment(cfg: DictConfig) -> None:
                     pd.testing.assert_index_equal(prep_data.columns, df.columns)
                     w_est = df.to_numpy()
 
+        if cfg.problem.name == "er_graph":
+            from er_graph import sample_dag
+            X, dag = sample_dag(
+                n_samples=cfg.problem.n_samples,
+                d=cfg.problem.d,
+                s0=cfg.problem.s0,
+                graph_type=cfg.problem.get("graph_type", "ER"),
+                n_values=cfg.problem.get("n_values", 3),
+                dominant_prob=cfg.problem.get("dominant_prob", 0.8),
+                seed=cfg.problem.get("seed"),
+                return_dag=True,
+            )
+            col_names = [f"X{i}" for i in range(cfg.problem.d)]
+            prep_data = pd.DataFrame(X, columns=col_names)
+            w_est = dag['B']
+            row_and_col_names = prep_data.columns
+
         if cfg.problem.name == "cds":
             import cds_utils
             prep_data = cds_utils.load_data(cfg.problem.n, cfg.problem.granularity, cfg.problem.p, cfg.problem.data_path)

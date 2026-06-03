@@ -9,6 +9,7 @@ import torch
 
 from compute_tools import compute_predictor_errors
 from recommender_estimator import XGBRecommenderPredictor, REGRecommenderPredictor, HCRecommenderPredictor, compute_predictor_errors_and_cs_scikit, compute_predictor_errors_scikit
+from discrete_estimator import DiscreteRecommenderPredictor, compute_discrete_predictor_errors_scikit
 
 
 def get_mean_average_errors(prep_data, run_feats, target_col, w_est, row_and_col_names,
@@ -113,8 +114,11 @@ def create_model(model_name, w_est, target_col, row_and_col_names, custom_object
         torch.manual_seed(42)
         model = HCRecommenderPredictor(w_est, target_col, row_and_col_names, custom_objective,
                                        prep_data, solver_cfg)
+    elif model_name == "DISC":
+        model = DiscreteRecommenderPredictor(w_est, target_col, row_and_col_names, custom_objective,
+                                             prep_data, solver_cfg)
     if model is None:
-        raise ValueError("Model can be only XGB or REG.")
+        raise ValueError("Model can be only XGB, REG, HC, or DISC.")
     return model
 
 
@@ -141,7 +145,11 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
     prep_data = prep_data.dropna(subset=[target_col])
     y = prep_data[target_col]
 
-    score_normalizer = mean_squared_error(y, np.ones_like(y) * y.mean())
+    if isinstance(model, DiscreteRecommenderPredictor):
+        counts = np.bincount(y.astype(int))
+        score_normalizer = max(1e-9, 1.0 - counts.max() / len(y))
+    else:
+        score_normalizer = mean_squared_error(y, np.ones_like(y) * y.mean())
     #TODO this deletes only 30 columns out of 508, so I will do this so that scikit feature selection works (no nas)
     #prep_data = prep_data[full_feats]
     prep_data = prep_data.dropna(axis=1)
@@ -151,11 +159,13 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
 
     logging.info(f"Testing on columns {len(X.columns)}: {X.columns}")
 
+    _scorer = compute_predictor_errors_scikit if isinstance(model, DiscreteRecommenderPredictor) else compute_predictor_errors_scikit
+
     if 'feature_selector' in solver_cfg and solver_cfg.feature_selector == 'SequentialFeatureSelector':
         sfs = SequentialFeatureSelector(
             model,
             direction="forward",
-            scoring=compute_predictor_errors_scikit,
+            scoring=_scorer,
             cv=n_runs,
             n_features_to_select=n_features
         )
@@ -181,7 +191,7 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
 
     results = cross_validate(model, X_selected, y,
         cv=n_runs,
-        scoring=(lambda estimator, X, y: compute_predictor_errors_and_cs_scikit(estimator, X, y, estimator._w_est)) if isinstance(model,HCRecommenderPredictor) else compute_predictor_errors_scikit,
+        scoring=(lambda estimator, X, y: compute_predictor_errors_and_cs_scikit(estimator, X, y, estimator._w_est)) if isinstance(model, HCRecommenderPredictor) else _scorer,
         return_train_score=True
     )
 
