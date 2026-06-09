@@ -1,3 +1,4 @@
+import networkx as nx
 import numpy as np
 import torch
 import torch.nn as nn
@@ -330,6 +331,13 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         t = name_to_idx[self.target_col]
         others = [i for i in range(len(names)) if i != t]
 
+        # Directed graph over node indices for d-separation tests.
+        # W[i, j] != 0 means edge i → j.
+        G = nx.DiGraph()
+        G.add_nodes_from(range(len(names)))
+        G.add_edges_from((i, j) for i in range(len(names))
+                         for j in range(len(names)) if W[i, j] != 0)
+
         triplets = []
         for k in range(len(others)):
             for l in range(k + 1, len(others)):
@@ -341,23 +349,33 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                     rc = W[right, centre] != 0  # right → centre
                     cr = W[centre, right] != 0  # centre → right
 
+                    # The numeric (conditional) independence each constraint
+                    # encodes holds only when the conditioning set actually
+                    # d-separates the two endpoints in the *full* DAG — not just
+                    # when the direct left↔right edge is absent.  Indirect active
+                    # paths through other nodes would otherwise invalidate the fact.
+                    #   chain / fork : left ⊥ right | {centre}
+                    #   collider     : left ⊥ right | {}        (marginal)
+                    sep_given_centre = nx.is_d_separator(G, {left}, {right}, {centre})
+                    sep_marginal     = nx.is_d_separator(G, {left}, {right}, set())
+
                     # chain:    left → centre → right
-                    if lc and cr:
+                    if lc and cr and sep_given_centre:
                         triplets.append({'type': 'chain',
                                          'variables': (names[left], names[centre], names[right]),
                                          'center': names[centre]})
                     # chain:    right → centre → left
-                    if rc and cl:
+                    if rc and cl and sep_given_centre:
                         triplets.append({'type': 'chain',
                                          'variables': (names[right], names[centre], names[left]),
                                          'center': names[centre]})
                     # fork:     left ← centre → right
-                    if cl and cr:
+                    if cl and cr and sep_given_centre:
                         triplets.append({'type': 'fork',
                                          'variables': (names[left], names[centre], names[right]),
                                          'center': names[centre]})
                     # collider: left → centre ← right
-                    if lc and rc:
+                    if lc and rc and sep_marginal:
                         triplets.append({'type': 'collider',
                                          'variables': (names[left], names[centre], names[right]),
                                          'center': names[centre]})

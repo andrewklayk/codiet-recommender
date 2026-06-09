@@ -159,7 +159,7 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
 
     logging.info(f"Testing on columns {len(X.columns)}: {X.columns}")
 
-    _scorer = compute_predictor_errors_scikit if isinstance(model, DiscreteRecommenderPredictor) else compute_predictor_errors_scikit
+    _scorer = compute_discrete_predictor_errors_scikit if isinstance(model, DiscreteRecommenderPredictor) else compute_predictor_errors_scikit
 
     if 'feature_selector' in solver_cfg and solver_cfg.feature_selector == 'SequentialFeatureSelector':
         sfs = SequentialFeatureSelector(
