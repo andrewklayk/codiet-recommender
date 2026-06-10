@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from enum import Enum
+
 import networkx as nx
 import numpy as np
 import torch
@@ -10,6 +13,27 @@ from sklearn.metrics import accuracy_score
 def compute_discrete_predictor_errors_scikit(estimator, X, y):
     """Scoring for discrete estimator: returns classification error (1 - accuracy)."""
     return 1.0 - accuracy_score(y, estimator.predict(X))
+
+
+class TripletType(Enum):
+    """Causal structure of a triplet centred on `centre`.
+
+    CHAIN    — left → centre → right
+    FORK     — left ← centre → right   (common cause)
+    COLLIDER — left → centre ← right   (common effect / v-structure)
+    """
+    CHAIN = 'chain'
+    FORK = 'fork'
+    COLLIDER = 'collider'
+
+
+@dataclass(frozen=True)
+class Triplet:
+    """A causal triplet over three named variables, centred on `centre`."""
+    type: TripletType
+    left: str
+    centre: str
+    right: str
 
 
 class _MLP(nn.Module):
@@ -105,9 +129,9 @@ class TripletConstraintsFn:
         zero when the constraint holds, positive otherwise.
         Fork / collider: placeholder zeros (filled in later steps).
         """
-        if triplet['type'] == 'chain':
+        A, B, C = triplet.left, triplet.centre, triplet.right
+        if triplet.type == TripletType.CHAIN:
             # chain A→B→C:  E(C|A=a, B=b) = E(C|B=b)  for all (a,b)
-            A, B, C = triplet['variables']
             total = torch.zeros(1)
             n = 0
             for b_val in range(self.n_values):
@@ -119,38 +143,35 @@ class TripletConstraintsFn:
                     n += 1
             return total / n
 
-        if triplet['type'] == 'fork':
-            # fork A←C→B:  E(A·B|C=c) = E(A|C=c)·E(B|C=c)  for all c
-            A, C, B = triplet['variables']  # centre is the fork node
+        if triplet.type == TripletType.FORK:
+            # fork A←B→C:  E(A·C|B=b) = E(A|B=b)·E(C|B=b)  for all b
             total = torch.zeros(1)
-            for c_val in range(self.n_values):
-                e_ab_c = self.expectation_product(A, B, X_batch, y_batch,
-                                                  given={C: c_val})
-                e_a_c  = self.expectation(A, X_batch, y_batch, given={C: c_val})
-                e_b_c  = self.expectation(B, X_batch, y_batch, given={C: c_val})
-                total  = total + (e_ab_c - e_a_c * e_b_c) ** 2
+            for b_val in range(self.n_values):
+                e_ac_b = self.expectation_product(A, C, X_batch, y_batch,
+                                                  given={B: b_val})
+                e_a_b  = self.expectation(A, X_batch, y_batch, given={B: b_val})
+                e_c_b  = self.expectation(C, X_batch, y_batch, given={B: b_val})
+                total  = total + (e_ac_b - e_a_b * e_c_b) ** 2
             return total / self.n_values
 
-        if triplet['type'] == 'collider':
-            # collider A→C←B:
-            #   equality  : E(A·B) = E(A)·E(B)          (marginal independence)
-            #   inequality: E(A·B|C=c) ≠ E(A|C=c)·E(B|C=c)  for all c
+        if triplet.type == TripletType.COLLIDER:
+            # collider A→B←C:
+            #   equality  : E(A·C) = E(A)·E(C)          (marginal independence)
+            #   inequality: E(A·C|B=b) ≠ E(A|B=b)·E(C|B=b)  for all b
             #               encoded as hinge: max(0, τ − |difference|)
-            A, C, B = triplet['variables']  # centre is the collider node
-
             # --- equality part ---
-            eq = (self.expectation_product(A, B, X_batch, y_batch)
+            eq = (self.expectation_product(A, C, X_batch, y_batch)
                   - self.expectation(A, X_batch, y_batch)
-                  * self.expectation(B, X_batch, y_batch)) ** 2
+                  * self.expectation(C, X_batch, y_batch)) ** 2
 
-            # --- inequality part: hinge over all c values ---
+            # --- inequality part: hinge over all b values ---
             hinge = torch.zeros(1)
-            for c_val in range(self.n_values):
-                e_ab_c = self.expectation_product(A, B, X_batch, y_batch,
-                                                  given={C: c_val})
-                e_a_c  = self.expectation(A, X_batch, y_batch, given={C: c_val})
-                e_b_c  = self.expectation(B, X_batch, y_batch, given={C: c_val})
-                diff   = (e_ab_c - e_a_c * e_b_c).abs()
+            for b_val in range(self.n_values):
+                e_ac_b = self.expectation_product(A, C, X_batch, y_batch,
+                                                  given={B: b_val})
+                e_a_b  = self.expectation(A, X_batch, y_batch, given={B: b_val})
+                e_c_b  = self.expectation(C, X_batch, y_batch, given={B: b_val})
+                diff   = (e_ac_b - e_a_b * e_c_b).abs()
                 hinge  = hinge + torch.relu(self.collider_margin - diff)
             hinge = hinge / self.n_values
 
@@ -320,23 +341,20 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             collider :  left → centre ← right   (common effect / v-structure)
 
         Returns:
-            list[dict] each with keys:
-                'type'      : 'chain' | 'fork' | 'collider'
-                'variables' : (left, centre, right) variable name strings
-                'center'    : name of the centre node
+            list[Triplet] — each with .type (a TripletType) and the
+            .left / .centre / .right variable name strings.
         """
-        W = self.w_est
         names = list(self.row_and_col_names)
         name_to_idx = {name: idx for idx, name in enumerate(names)}
         t = name_to_idx[self.target_col]
         others = [i for i in range(len(names)) if i != t]
 
         # Directed graph over node indices for d-separation tests.
-        # W[i, j] != 0 means edge i → j.
+        # self.w_est[i, j] != 0 means edge i → j.
         G = nx.DiGraph()
         G.add_nodes_from(range(len(names)))
         G.add_edges_from((i, j) for i in range(len(names))
-                         for j in range(len(names)) if W[i, j] != 0)
+                         for j in range(len(names)) if self.w_est[i, j] != 0)
 
         triplets = []
         for k in range(len(others)):
@@ -344,10 +362,10 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 i, j = others[k], others[l]
                 # rotate through each node as centre; left/right are the remaining two
                 for centre, left, right in [(t, i, j), (i, t, j), (j, t, i)]:
-                    lc = W[left, centre] != 0   # left  → centre
-                    cl = W[centre, left] != 0   # centre → left
-                    rc = W[right, centre] != 0  # right → centre
-                    cr = W[centre, right] != 0  # centre → right
+                    lc = self.w_est[left, centre] != 0   # left  → centre
+                    cl = self.w_est[centre, left] != 0   # centre → left
+                    rc = self.w_est[right, centre] != 0  # right → centre
+                    cr = self.w_est[centre, right] != 0  # centre → right
 
                     # The numeric (conditional) independence each constraint
                     # encodes holds only when the conditioning set actually
@@ -361,23 +379,15 @@ class DiscreteRecommenderPredictor(BaseEstimator):
 
                     # chain:    left → centre → right
                     if lc and cr and sep_given_centre:
-                        triplets.append({'type': 'chain',
-                                         'variables': (names[left], names[centre], names[right]),
-                                         'center': names[centre]})
+                        triplets.append(Triplet(TripletType.CHAIN, names[left], names[centre], names[right]))
                     # chain:    right → centre → left
                     if rc and cl and sep_given_centre:
-                        triplets.append({'type': 'chain',
-                                         'variables': (names[right], names[centre], names[left]),
-                                         'center': names[centre]})
+                        triplets.append(Triplet(TripletType.CHAIN, names[right], names[centre], names[left]))
                     # fork:     left ← centre → right
                     if cl and cr and sep_given_centre:
-                        triplets.append({'type': 'fork',
-                                         'variables': (names[left], names[centre], names[right]),
-                                         'center': names[centre]})
+                        triplets.append(Triplet(TripletType.FORK, names[left], names[centre], names[right]))
                     # collider: left → centre ← right
                     if lc and rc and sep_marginal:
-                        triplets.append({'type': 'collider',
-                                         'variables': (names[left], names[centre], names[right]),
-                                         'center': names[centre]})
+                        triplets.append(Triplet(TripletType.COLLIDER, names[left], names[centre], names[right]))
 
         return triplets
