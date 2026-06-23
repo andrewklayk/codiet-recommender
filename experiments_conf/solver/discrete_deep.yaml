@@ -1,4 +1,4 @@
-name: discrete
+name: discrete_deep
 model_name: DISC
 custom_objective: none
 #N_SELECT_FEATURES: 5
@@ -9,24 +9,15 @@ recalculate_dag: false
 
 # neural network architecture
 # backbone: mlp | deep_mlp | onehot_mlp | embedding_mlp | transformer
-network: mlp
-hidden_dim: 64
-n_layers: 2
-# extra knobs used by some backbones:
-# dropout: 0.1        # deep_mlp / onehot_mlp / embedding_mlp / transformer
-# emb_dim: 8          # embedding_mlp
-# d_model: 32         # transformer
-# n_heads: 4          # transformer
-# dim_feedforward: 64 # transformer
+network: deep_mlp
+hidden_dim: 128
+n_layers: 4
+dropout: 0.1
 
 # training
 n_epochs: 50
 batch_size: 32
 learning_rate: 0.001
-
-# interaction-graph baseline: keep only the target's direct causes (parents)
-# as input features, dropping everything else. Combines with use_alm.
-restrict_to_parents: false
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 # set use_alm: true and wire up constraints_fn in code to activate

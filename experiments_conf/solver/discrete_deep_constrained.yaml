@@ -1,0 +1,28 @@
+name: discrete_deep_constrained
+model_name: DISC
+custom_objective: none
+#N_SELECT_FEATURES: 5
+n_runs: 5
+recalculate_dag: false
+
+#feature_selector: null   # skip SFS — train once on all features with ALM
+
+# neural network architecture
+# backbone: mlp | deep_mlp | onehot_mlp | embedding_mlp | transformer
+network: deep_mlp
+hidden_dim: 128
+n_layers: 4
+dropout: 0.1
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# constrained training via humancompatible/train (pip install humancompatible-train)
+use_alm: true
+alm_lr: 0.1
+alm_momentum: 0.5
+
+# debugging
+debug: false

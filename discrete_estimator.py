@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from enum import Enum
 
@@ -8,6 +9,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.base import BaseEstimator
 from sklearn.metrics import accuracy_score
+
+from discrete_networks import build_network
 
 
 def compute_discrete_predictor_errors_scikit(estimator, X, y):
@@ -34,21 +37,6 @@ class Triplet:
     left: str
     centre: str
     right: str
-
-
-class _MLP(nn.Module):
-    """Simple MLP for multi-class classification."""
-
-    def __init__(self, n_features, n_classes, hidden_dim, n_layers):
-        super().__init__()
-        layers = [nn.Linear(n_features, hidden_dim), nn.ReLU()]
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
-        layers.append(nn.Linear(hidden_dim, n_classes))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
 
 
 class TripletConstraintsFn:
@@ -133,15 +121,13 @@ class TripletConstraintsFn:
         if triplet.type == TripletType.CHAIN:
             # chain A→B→C:  E(C|A=a, B=b) = E(C|B=b)  for all (a,b)
             total = torch.zeros(1)
-            n = 0
             for b_val in range(self.n_values):
                 e_c_b = self.expectation(C, X_batch, y_batch, given={B: b_val})
                 for a_val in range(self.n_values):
                     e_c_ab = self.expectation(C, X_batch, y_batch,
                                               given={A: a_val, B: b_val})
                     total = total + (e_c_ab - e_c_b) ** 2
-                    n += 1
-            return total / n
+            return total / self.n_values / self.n_values
 
         if triplet.type == TripletType.FORK:
             # fork A←B→C:  E(A·C|B=b) = E(A|B=b)·E(C|B=b)  for all b
@@ -189,7 +175,7 @@ class TripletConstraintsFn:
 
 
 class DiscreteRecommenderPredictor(BaseEstimator):
-    """Scikit-learn compatible MLP classifier for discrete variable prediction.
+    """Scikit-learn compatible neural classifier for discrete variable prediction.
 
     Accepts the same constructor signature as the other RecommenderPredictor
     classes so it plugs into the existing create_model / run_feature_selection_scikit
@@ -209,11 +195,23 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             plugging in humancompatible/train-style constrained training.
 
     NN hyper-parameters (read from cfg, all optional):
-        hidden_dim   (int,   default 64)   hidden layer width
-        n_layers     (int,   default 2)    number of hidden layers
+        network      (str,   default 'mlp') backbone to use; one of
+                     discrete_networks.NETWORK_REGISTRY (mlp, deep_mlp,
+                     onehot_mlp, embedding_mlp, transformer). Each backbone
+                     reads its own architecture knobs (hidden_dim, n_layers,
+                     emb_dim, d_model, ...) from cfg.
         n_epochs     (int,   default 50)   training epochs
         batch_size   (int,   default 32)   mini-batch size
         learning_rate(float, default 1e-3) Adam learning rate
+
+    Feature-restriction baseline (read from cfg):
+        restrict_to_parents (bool, default False) when True, the model is fed
+            only the direct causes (parents) of the target in the interaction
+            graph w_est; all other columns are dropped. Combines with use_alm:
+            constraints are then restricted to triplets whose variables all
+            survive. Orthogonal to use_alm, so the four combinations
+            (vanilla / constrained) x (all features / parents only) are
+            available.
 
     ALM hyper-parameters (read from cfg, used only when use_alm=True):
         use_alm      (bool,  default False)
@@ -234,6 +232,36 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         self._rf_model_ = None
         self._w_est = w_est
         self._classes = None
+        self._feature_mask = None
+        self._kept_features = None
+
+    # ------------------------------------------------------------------
+    # feature restriction (interaction-graph baseline)
+    # ------------------------------------------------------------------
+
+    def _parent_features(self, feature_names):
+        """Subset of `feature_names` that are direct causes (parents) of the target.
+
+        Uses the interaction graph w_est (w_est[i, j] != 0 means i -> j): the
+        parents of the target are exactly the variables with a directed edge
+        into it. Order follows `feature_names`.
+        """
+        names = list(self.row_and_col_names)
+        name_to_idx = {n: i for i, n in enumerate(names)}
+        t = name_to_idx[self.target_col]
+        parents = {names[i] for i in range(len(names)) if self.w_est[i, t] != 0}
+        return [f for f in feature_names if f in parents]
+
+    def _select_features(self, X_arr):
+        """Apply the fitted column mask; fall back to a constant column.
+
+        When the target has no retained parents (e.g. a root node under
+        restrict_to_parents) the mask is empty and we feed a single constant
+        feature so the network simply learns the class prior.
+        """
+        if self._feature_mask:
+            return X_arr[:, self._feature_mask]
+        return np.zeros((X_arr.shape[0], 1), dtype=X_arr.dtype)
 
     # ------------------------------------------------------------------
     # training
@@ -241,28 +269,52 @@ class DiscreteRecommenderPredictor(BaseEstimator):
 
     def fit(self, X, y=None):
         # --- resolve hyper-parameters from cfg ---
-        hidden_dim    = self.cfg.get('hidden_dim',    64)
-        n_layers      = self.cfg.get('n_layers',      2)
+        # (network architecture knobs like hidden_dim/n_layers are read by the
+        #  selected backbone itself in discrete_networks.build_network)
         n_epochs      = self.cfg.get('n_epochs',      50)
         batch_size    = self.cfg.get('batch_size',    32)
         lr            = self.cfg.get('learning_rate', 1e-3)
         use_alm       = self.cfg.get('use_alm',       False)
-        n_constraints = getattr(self.constraints_fn, 'n_constraints',
-                               self.cfg.get('n_constraints', 1))
         alm_lr        = self.cfg.get('alm_lr',        0.1)
         alm_momentum  = self.cfg.get('alm_momentum',  0.5)
+        restrict      = self.cfg.get('restrict_to_parents', False)
+
+        # --- feature restriction (interaction-graph baseline) ---
+        # When restrict_to_parents=True we keep only the direct causes (parents)
+        # of the target and drop every other column from the model's input.
+        feature_names = (list(X.columns) if hasattr(X, 'columns')
+                         else [n for n in self.row_and_col_names
+                               if n != self.target_col])
+        if restrict:
+            kept = self._parent_features(feature_names)
+            kept_set = set(kept)
+            self._feature_mask = [i for i, f in enumerate(feature_names)
+                                  if f in kept_set]
+        else:
+            kept = list(feature_names)
+            self._feature_mask = list(range(len(feature_names)))
+        self._kept_features = kept
 
         # --- auto-inject TripletConstraintsFn when use_alm=True and no fn provided ---
         if use_alm and self.constraints_fn is None:
-            feature_names = (list(X.columns) if hasattr(X, 'columns')
-                             else [n for n in self.row_and_col_names
-                                   if n != self.target_col])
             y_arr = np.asarray(y)
             n_values_inferred = int(y_arr.max()) + 1
+            triplets = self.get_target_triplets()
+            if restrict:
+                # A constraint over an excluded variable is meaningless for a
+                # model that never sees it: keep only triplets whose variables
+                # all remain (the target plus the retained parents).
+                allowed = set(kept) | {self.target_col}
+                triplets = [tr for tr in triplets
+                            if {tr.left, tr.centre, tr.right} <= allowed]
             self.constraints_fn = TripletConstraintsFn(
-                self.get_target_triplets(), feature_names,
-                self.target_col, n_values_inferred
+                triplets, kept, self.target_col, n_values_inferred
             )
+
+        # Determine the dual dimension AFTER the constraints function exists, so
+        # every constraint it returns gets its own dual variable in the ALM.
+        n_constraints = getattr(self.constraints_fn, 'n_constraints',
+                                self.cfg.get('n_constraints', 1))
 
         # --- label encoding ---
         y_np = np.asarray(y)
@@ -270,8 +322,9 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         label_to_idx = {c: i for i, c in enumerate(self._classes)}
         y_enc = np.array([label_to_idx[c] for c in y_np], dtype=np.int64)
 
-        # --- tensors & dataloader ---
-        X_t = torch.tensor(np.asarray(X), dtype=torch.float32)
+        # --- tensors & dataloader (features restricted to self._feature_mask) ---
+        X_t = torch.tensor(self._select_features(np.asarray(X)),
+                           dtype=torch.float32)
         y_t = torch.tensor(y_enc)
         loader = DataLoader(TensorDataset(X_t, y_t),
                             batch_size=batch_size, shuffle=True)
@@ -279,7 +332,11 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         # --- build network ---
         n_features = X_t.shape[1]
         n_classes  = len(self._classes)
-        model = _MLP(n_features, n_classes, hidden_dim, n_layers)
+        # category cardinality for encoders/embeddings: max index over the
+        # features (plus 1). Raw-float backbones ignore it.
+        n_values = int(X_t.max().item()) + 1 if X_t.numel() else 1
+        network_name = self.cfg.get('network', 'mlp')
+        model = build_network(network_name, n_features, n_classes, n_values, self.cfg)
         criterion = nn.CrossEntropyLoss()
 
         # --- optimiser (plain or ALM-wrapped) ---
@@ -294,7 +351,17 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             dual = None
 
         # --- training loop ---
+        # We keep the *best* model seen during training rather than the last
+        # one: after each epoch the model's cross-entropy on the training set is
+        # evaluated (no_grad) and the parameters with the lowest CE are cached.
+        # CE is used as the selection criterion for both the plain and the
+        # constrained variants because it is the underlying prediction
+        # objective and is comparable across epochs (unlike the Lagrangian,
+        # whose value shifts as the dual variables update).
+        best_loss = float('inf')
+        best_state = copy.deepcopy(model.state_dict())
         for _ in range(n_epochs):
+            model.train()
             for X_batch, y_batch in loader:
                 logits = model(X_batch)
                 loss = criterion(logits, y_batch)
@@ -310,6 +377,16 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 optimizer.step()
                 optimizer.zero_grad()
 
+            # --- model selection: track lowest training cross-entropy ---
+            model.eval()
+            with torch.no_grad():
+                epoch_loss = criterion(model(X_t), y_t).item()
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                best_state = copy.deepcopy(model.state_dict())
+
+        model.load_state_dict(best_state)
+        model.eval()
         self._rf_model_ = model
         self._w_est = self.w_est
         return self
@@ -319,7 +396,8 @@ class DiscreteRecommenderPredictor(BaseEstimator):
     # ------------------------------------------------------------------
 
     def predict(self, X):
-        X_t = torch.tensor(np.asarray(X), dtype=torch.float32)
+        X_t = torch.tensor(self._select_features(np.asarray(X)),
+                           dtype=torch.float32)
         with torch.no_grad():
             indices = self._rf_model_(X_t).argmax(dim=1).numpy()
         return self._classes[indices]
