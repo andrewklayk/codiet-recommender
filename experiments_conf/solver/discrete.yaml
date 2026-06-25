@@ -24,9 +24,12 @@ n_epochs: 50
 batch_size: 32
 learning_rate: 0.001
 
-# interaction-graph baseline: keep only the target's direct causes (parents)
-# as input features, dropping everything else. Combines with use_alm.
+# interaction-graph baselines: restrict the model's input features.
+#   restrict_to_parents:        keep only the target's direct causes (parents)
+#   restrict_to_markov_blanket: keep parents + children + co-parents
+# markov_blanket takes precedence if both are true. Combines with use_alm.
 restrict_to_parents: false
+restrict_to_markov_blanket: false
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 # set use_alm: true and wire up constraints_fn in code to activate

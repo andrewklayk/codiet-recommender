@@ -5,15 +5,18 @@ For each backbone family we cross two independent axes:
 
   * constraints : vanilla cross-entropy (use_alm=false) vs causally constrained
                   ALM training (use_alm=true)
-  * features    : all features vs only the target's direct causes (parents in
-                  the interaction graph; restrict_to_parents=true)
+  * features    : all features / only the target's direct causes (parents) /
+                  the target's Markov blanket (parents + children + co-parents),
+                  via restrict_to_parents / restrict_to_markov_blanket
 
-giving four settings per backbone:
+giving six settings per backbone:
 
     uncon_all   vanilla,     all features
     con_all     constrained, all features
-    uncon_par   vanilla,     parents only   (interaction-graph baseline)
-    con_par     constrained, parents only   (baseline + constraints)
+    uncon_par   vanilla,     parents only        (interaction-graph baseline)
+    con_par     constrained, parents only        (baseline + constraints)
+    uncon_mb    vanilla,     Markov blanket
+    con_mb      constrained, Markov blanket
 
 Backbone -> (unconstrained config, constrained config):
 
@@ -34,7 +37,16 @@ generated er_graph datasets. Results are written to:
                                             target, four settings per backbone;
                                             best per backbone bold.
                   sheet 'by_feature_train': same for train error.
+                  sheet 'violation_overall' : avg constraint violation over
+                                            seeds & features, network x setting;
+                                            lowest per network bold.
+                  sheet 'violation_by_feature': avg violation per target.
                   sheet 'raw'             : every individual run.
+
+Constraint violation measures how much each fitted model's predictions break the
+causal-independence constraints implied by w_est (see
+DiscreteRecommenderPredictor.constraint_violation); it is logged for every
+setting, constrained or not.
 
 This is the multi-backbone sibling of test_all_features.py.
 
@@ -56,6 +68,7 @@ from omegaconf import OmegaConf
 from openpyxl.styles import Font
 
 from recommender_utils import run_feature_selection_scikit
+from discrete_estimator import DiscreteRecommenderPredictor
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -70,12 +83,16 @@ NETWORKS = [
     ("transformer",   "discrete_transformer", "discrete_transformer_constrained"),
 ]
 
-# (setting label, which config variant, restrict_to_parents flag)
+# (setting label, which config variant, feature-restriction mode)
+#   mode: 'none' = all features, 'parents' = direct causes only,
+#         'markov_blanket' = parents + children + co-parents
 SETTINGS = [
-    ("uncon_all", "uncon", False),
-    ("con_all",   "con",   False),
-    ("uncon_par", "uncon", True),
-    ("con_par",   "con",   True),
+    ("uncon_all", "uncon", "none"),
+    ("con_all",   "con",   "none"),
+#    ("uncon_par", "uncon", "parents"),
+#    ("con_par",   "con",   "parents"),
+    ("uncon_mb",  "uncon", "markov_blanket"),
+    ("con_mb",    "con",   "markov_blanket"),
 ]
 SETTING_ORDER = [s[0] for s in SETTINGS]
 
@@ -137,6 +154,29 @@ def evaluate(prep_data, w_est, row_and_col_names, target, features, solver_cfg, 
         solver_cfg=solver_cfg,
     )
     return float(train_err), float(test_err)
+
+
+def fit_violation(prep_data, w_est, row_and_col_names, target, features,
+                  solver_cfg, seed):
+    """Constraint violation of one model fitted on the full data.
+
+    The CV pipeline does not expose its fitted estimator, so we fit one extra
+    model on the full (X, y) with the same config/features as evaluate() and
+    reuse DiscreteRecommenderPredictor.constraint_violation. Returns the total
+    violation (NaN on failure). Honours the cfg restriction flags already set by
+    the caller.
+    """
+    try:
+        torch.manual_seed(seed)
+        X = prep_data[features]
+        y = prep_data[target]
+        model = DiscreteRecommenderPredictor(
+            w_est, target, row_and_col_names, solver_cfg.custom_objective,
+            None, solver_cfg)
+        model.fit(X, y)
+        return float(model.constraint_violation(X)["total"])
+    except Exception:
+        return float("nan")
 
 
 def bold_min_cells(ws, df, groups):
@@ -232,9 +272,10 @@ def main():
         for target in targets:
             features = [c for c in col_names if c != target]
             for label in net_labels:
-                for setting, variant, restrict in SETTINGS:
+                for setting, variant, mode in SETTINGS:
                     cfg = solvers[(label, variant)]
-                    cfg.restrict_to_parents = restrict
+                    cfg.restrict_to_parents = (mode == "parents")
+                    cfg.restrict_to_markov_blanket = (mode == "markov_blanket")
                     try:
                         tr, te = evaluate(prep_data, w_est, row_and_col_names,
                                           target, features, cfg, seed)
@@ -242,14 +283,16 @@ def main():
                         print(f"  [WARN] seed={seed} {target} {label}/{setting} "
                               f"failed: {exc}")
                         tr, te = float("nan"), float("nan")
+                    viol = fit_violation(prep_data, w_est, row_and_col_names,
+                                         target, features, cfg, seed)
                     records.append({
                         "seed": seed, "target": target, "network": label,
                         "setting": setting, "variant": variant,
-                        "features": "parents" if restrict else "all",
-                        "train_error": tr, "test_error": te,
+                        "features": mode,
+                        "train_error": tr, "test_error": te, "violation": viol,
                     })
                     print(f"  seed={seed} {target:>3s} {label:14s} {setting:9s} "
-                          f"train={tr:.4f} test={te:.4f}")
+                          f"train={tr:.4f} test={te:.4f} viol={viol:.4f}")
 
     raw = pd.DataFrame(records)
     csv_path = Path(f"{args.out}.csv")
@@ -275,16 +318,43 @@ def main():
     overall_groups = [[f"{s}_train" for s in SETTING_ORDER],
                       [f"{s}_test" for s in SETTING_ORDER]]
 
+    # ---- constraint-violation summaries (avg over seeds) ----
+    gv = raw.groupby(["network", "setting", "target"])["violation"].mean()
+    viol_by_feat = pd.DataFrame(index=targets_sorted)
+    viol_by_feat.index.name = "feature"
+    viol_feat_groups = []
+    for net in net_labels:
+        cols = []
+        for setting in SETTING_ORDER:
+            col = f"{net}_{setting}"
+            viol_by_feat[col] = gv.loc[(net, setting)].reindex(targets_sorted).values
+            cols.append(col)
+        viol_feat_groups.append(cols)
+    viol_by_feat = viol_by_feat.round(4)
+
+    ov = raw.groupby(["network", "setting"])["violation"].mean()
+    viol_overall = pd.DataFrame(index=net_labels)
+    viol_overall.index.name = "network"
+    for setting in SETTING_ORDER:
+        viol_overall[setting] = [ov.get((n, setting), np.nan) for n in net_labels]
+    viol_overall = viol_overall.round(4)
+
     # ---- write xlsx with bold-min (best setting) formatting ----
     xlsx_path = Path(f"{args.out}.xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         overall.to_excel(writer, sheet_name="summary_overall")
         by_test.to_excel(writer, sheet_name="by_feature_test")
         by_train.to_excel(writer, sheet_name="by_feature_train")
+        viol_overall.to_excel(writer, sheet_name="violation_overall")
+        viol_by_feat.to_excel(writer, sheet_name="violation_by_feature")
         raw.to_excel(writer, sheet_name="raw", index=False)
         bold_min_cells(writer.sheets["summary_overall"], overall, overall_groups)
         bold_min_cells(writer.sheets["by_feature_test"], by_test, by_test_groups)
         bold_min_cells(writer.sheets["by_feature_train"], by_train, by_train_groups)
+        bold_min_cells(writer.sheets["violation_overall"], viol_overall,
+                       [SETTING_ORDER])
+        bold_min_cells(writer.sheets["violation_by_feature"], viol_by_feat,
+                       viol_feat_groups)
 
     print("\n==== Overall test error (avg over seeds & features; lower is better) ====")
     print(overall[[f"{s}_test" for s in SETTING_ORDER]].to_string())

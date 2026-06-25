@@ -207,11 +207,15 @@ class DiscreteRecommenderPredictor(BaseEstimator):
     Feature-restriction baseline (read from cfg):
         restrict_to_parents (bool, default False) when True, the model is fed
             only the direct causes (parents) of the target in the interaction
-            graph w_est; all other columns are dropped. Combines with use_alm:
-            constraints are then restricted to triplets whose variables all
-            survive. Orthogonal to use_alm, so the four combinations
-            (vanilla / constrained) x (all features / parents only) are
-            available.
+            graph w_est; all other columns are dropped.
+        restrict_to_markov_blanket (bool, default False) when True, the model is
+            fed only the target's Markov blanket (parents + children +
+            co-parents) -- the variables with predictive power under
+            d-separation. Takes precedence over restrict_to_parents if both set.
+        Either restriction combines with use_alm: constraints are then limited to
+            triplets whose variables all survive. Orthogonal to use_alm, so all
+            (vanilla / constrained) x (all / parents / markov_blanket)
+            combinations are available.
 
     ALM hyper-parameters (read from cfg, used only when use_alm=True):
         use_alm      (bool,  default False)
@@ -252,10 +256,29 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         parents = {names[i] for i in range(len(names)) if self.w_est[i, t] != 0}
         return [f for f in feature_names if f in parents]
 
+    def _markov_blanket_features(self, feature_names):
+        """Subset of `feature_names` in the target's Markov blanket.
+
+        The Markov blanket is parents + children + co-parents (the other parents
+        of the target's children). Under the interaction graph w_est these are
+        exactly the variables that carry predictive information about the target:
+        everything outside the blanket is d-separated from the target given it.
+        Order follows `feature_names`.
+        """
+        names = list(self.row_and_col_names)
+        name_to_idx = {n: i for i, n in enumerate(names)}
+        t = name_to_idx[self.target_col]
+        W = self.w_est
+        parents = {i for i in range(len(names)) if W[i, t] != 0}
+        children = {j for j in range(len(names)) if W[t, j] != 0}
+        coparents = {i for c in children for i in range(len(names)) if W[i, c] != 0}
+        mb = {names[i] for i in (parents | children | coparents) - {t}}
+        return [f for f in feature_names if f in mb]
+
     def _select_features(self, X_arr):
         """Apply the fitted column mask; fall back to a constant column.
 
-        When the target has no retained parents (e.g. a root node under
+        When the target has no retained features (e.g. a root node under
         restrict_to_parents) the mask is empty and we feed a single constant
         feature so the network simply learns the class prior.
         """
@@ -277,21 +300,34 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         use_alm       = self.cfg.get('use_alm',       False)
         alm_lr        = self.cfg.get('alm_lr',        0.1)
         alm_momentum  = self.cfg.get('alm_momentum',  0.5)
-        restrict      = self.cfg.get('restrict_to_parents', False)
 
-        # --- feature restriction (interaction-graph baseline) ---
-        # When restrict_to_parents=True we keep only the direct causes (parents)
-        # of the target and drop every other column from the model's input.
+        # --- resolve the feature-restriction mode (interaction-graph baseline) ---
+        # 'markov_blanket' keeps parents + children + co-parents; 'parents' keeps
+        # only the direct causes; 'none' keeps everything. Markov blanket takes
+        # precedence if both flags are set.
+        if self.cfg.get('restrict_to_markov_blanket', False):
+            restrict_mode = 'markov_blanket'
+        elif self.cfg.get('restrict_to_parents', False):
+            restrict_mode = 'parents'
+        else:
+            restrict_mode = 'none'
+
+        # --- feature restriction ---
         feature_names = (list(X.columns) if hasattr(X, 'columns')
                          else [n for n in self.row_and_col_names
                                if n != self.target_col])
-        if restrict:
+        if restrict_mode == 'markov_blanket':
+            kept = self._markov_blanket_features(feature_names)
+        elif restrict_mode == 'parents':
             kept = self._parent_features(feature_names)
+        else:
+            kept = list(feature_names)
+
+        if restrict_mode != 'none':
             kept_set = set(kept)
             self._feature_mask = [i for i, f in enumerate(feature_names)
                                   if f in kept_set]
         else:
-            kept = list(feature_names)
             self._feature_mask = list(range(len(feature_names)))
         self._kept_features = kept
 
@@ -300,10 +336,10 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             y_arr = np.asarray(y)
             n_values_inferred = int(y_arr.max()) + 1
             triplets = self.get_target_triplets()
-            if restrict:
+            if restrict_mode != 'none':
                 # A constraint over an excluded variable is meaningless for a
                 # model that never sees it: keep only triplets whose variables
-                # all remain (the target plus the retained parents).
+                # all remain (the target plus the retained features).
                 allowed = set(kept) | {self.target_col}
                 triplets = [tr for tr in triplets
                             if {tr.left, tr.centre, tr.right} <= allowed]
@@ -401,6 +437,45 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         with torch.no_grad():
             indices = self._rf_model_(X_t).argmax(dim=1).numpy()
         return self._classes[indices]
+
+    def constraint_violation(self, X, aggregate='mean'):
+        """How much the fitted model's predictions violate the causal constraints.
+
+        Reuses the very same triplet enumeration (get_target_triplets) and
+        TripletConstraintsFn as constrained training, but substitutes the model's
+        PREDICTED target for the true label, so the result measures whether the
+        trained predictor respects the conditional-independence constraints
+        implied by w_est. Works for any fitted model regardless of cfg.use_alm,
+        enabling a constrained-vs-unconstrained comparison.
+
+        X : the same feature frame/array passed to fit/predict (the estimator
+            applies its own feature mask internally for prediction; constraint
+            expectations use the feature columns present in X).
+        aggregate : 'mean' (default) or 'sum' over the per-triplet violations.
+
+        Returns dict {'total': float, 'per_triplet': list[float],
+        'n_triplets': int}; total is 0.0 when no triplet involves the target.
+        """
+        if self._rf_model_ is None:
+            raise RuntimeError("call fit() before constraint_violation()")
+        triplets = self.get_target_triplets()
+        if not triplets:
+            return {'total': 0.0, 'per_triplet': [], 'n_triplets': 0}
+        feature_names = (list(X.columns) if hasattr(X, 'columns')
+                         else [n for n in self.row_and_col_names
+                               if n != self.target_col])
+        X_arr = np.asarray(X)
+        preds = np.asarray(self.predict(X))
+        n_values = int(max(X_arr.max(initial=0), preds.max(initial=0))) + 1
+        cfn = TripletConstraintsFn(triplets, feature_names,
+                                   self.target_col, n_values)
+        with torch.no_grad():
+            viol = cfn(self._rf_model_,
+                       torch.tensor(X_arr, dtype=torch.float32),
+                       torch.tensor(preds)).detach().cpu().numpy()
+        total = float(viol.mean() if aggregate == 'mean' else viol.sum())
+        return {'total': total, 'per_triplet': viol.tolist(),
+                'n_triplets': len(triplets)}
 
     # ------------------------------------------------------------------
     # causal structure analysis

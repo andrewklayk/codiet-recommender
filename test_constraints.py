@@ -36,7 +36,14 @@ Output (errors are normalized by the majority-class baseline; lower is better):
                 by_setting_test : rows=(structure,target), cols=network x method;
                                   best method per network bold
                 by_setting_train: same for train error
+                violation_by_method : avg constraint violation, rows=network,
+                                  cols=method; lowest per network bold
+                violation_by_setting: avg violation per structure/target
                 raw             : every individual run
+
+Constraint violation (DiscreteRecommenderPredictor.constraint_violation)
+measures how much a fitted model's predictions break the causal-independence
+constraints implied by w_est; logged for every method, constrained or not.
 
 Usage:
     python test_constraints.py
@@ -54,7 +61,8 @@ import networkx as nx
 from openpyxl.styles import Font
 
 from er_graph import _generate_cpt, _topological_order, _sample_categorical
-from test_all_networks import NETWORKS, load_solver, evaluate, bold_min_cells
+from test_all_networks import (NETWORKS, load_solver, evaluate, bold_min_cells,
+                               fit_violation)
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -203,6 +211,7 @@ def main():
                             # no usable features (e.g. empty Markov blanket):
                             # nothing to learn from -> majority-class baseline
                             tr = te = 1.0
+                            viol = 0.0
                         else:
                             try:
                                 tr, te = evaluate(
@@ -212,22 +221,24 @@ def main():
                                 print(f"  [WARN] seed={seed} {struct}/{target} "
                                       f"{label}/{method} failed: {exc}")
                                 tr = te = float("nan")
+                            viol = fit_violation(p_data, p_B, p_names, target,
+                                                 features, cfg, seed)
                         records.append({
                             "seed": seed, "structure": struct, "target": target,
                             "network": label, "method": method,
                             "features": fs, "train_error": tr, "test_error": te,
+                            "violation": viol,
                         })
                         print(f"  seed={seed} {struct:8s} T={target} "
                               f"{label:14s} {method:10s} "
-                              f"train={tr:.4f} test={te:.4f}")
+                              f"train={tr:.4f} test={te:.4f} viol={viol:.4f}")
 
     raw = pd.DataFrame(records)
     csv_path = Path(f"{args.out}.csv")
     raw.to_csv(csv_path, index=False)
 
     # ---- headline: avg over seeds/structures/targets, rows=network, cols=method
-    def by_method(metric):
-        val = f"{metric}_error"
+    def by_method(val):
         g = raw.groupby(["network", "method"])[val].mean()
         df = pd.DataFrame(index=net_labels)
         df.index.name = "network"
@@ -241,8 +252,7 @@ def main():
     # (which assume exactly one index column) stay aligned.
     settings = [(s, t) for s in STRUCTURES for t in NODES]
 
-    def by_setting(metric):
-        val = f"{metric}_error"
+    def by_setting(val):
         g = raw.groupby(["structure", "target", "network", "method"])[val].mean()
         df = pd.DataFrame(index=[f"{s}/{t}" for s, t in settings])
         df.index.name = "structure/target"
@@ -256,10 +266,12 @@ def main():
             groups.append(cols)   # bold best method within each network block
         return df.round(4), groups
 
-    bm_test, bm_test_g = by_method("test")
-    bm_train, bm_train_g = by_method("train")
-    bs_test, bs_test_g = by_setting("test")
-    bs_train, bs_train_g = by_setting("train")
+    bm_test, bm_test_g = by_method("test_error")
+    bm_train, bm_train_g = by_method("train_error")
+    bm_viol, bm_viol_g = by_method("violation")
+    bs_test, bs_test_g = by_setting("test_error")
+    bs_train, bs_train_g = by_setting("train_error")
+    bs_viol, bs_viol_g = by_setting("violation")
 
     xlsx_path = Path(f"{args.out}.xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
@@ -267,11 +279,15 @@ def main():
         bm_train.to_excel(writer, sheet_name="by_method_train")
         bs_test.to_excel(writer, sheet_name="by_setting_test")
         bs_train.to_excel(writer, sheet_name="by_setting_train")
+        bm_viol.to_excel(writer, sheet_name="violation_by_method")
+        bs_viol.to_excel(writer, sheet_name="violation_by_setting")
         raw.to_excel(writer, sheet_name="raw", index=False)
         bold_min_cells(writer.sheets["by_method_test"], bm_test, bm_test_g)
         bold_min_cells(writer.sheets["by_method_train"], bm_train, bm_train_g)
         bold_min_cells(writer.sheets["by_setting_test"], bs_test, bs_test_g)
         bold_min_cells(writer.sheets["by_setting_train"], bs_train, bs_train_g)
+        bold_min_cells(writer.sheets["violation_by_method"], bm_viol, bm_viol_g)
+        bold_min_cells(writer.sheets["violation_by_setting"], bs_viol, bs_viol_g)
 
     print("\n==== Test error by method (avg over seeds/structures/targets) ====")
     print(bm_test.to_string())
