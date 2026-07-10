@@ -7,3 +7,4 @@ mlflow.db
 data/energy_expenditure
 .claude
 test_all_features.py
+.claude/*

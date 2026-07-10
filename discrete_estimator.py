@@ -42,10 +42,17 @@ class Triplet:
 class TripletConstraintsFn:
     """Constraint function for ALM training, one violation per causal triplet.
 
+    The violations are computed from the model's PREDICTED target distribution
+    (so they are differentiable w.r.t. the model and the ALM update genuinely
+    drives the predictions toward the causal-independence facts) combined with
+    the observed feature data. `feature_names` must list the columns of the
+    X_batch the model is called on, in order.
+
     Args:
         triplets     : output of DiscreteRecommenderPredictor.get_target_triplets()
-        feature_names: ordered column names of X as passed to fit()
-        target_col   : name of the target variable (matches y_batch)
+        feature_names: ordered column names of X_batch passed to __call__
+        target_col   : name of the target variable (supplied by the model)
+        n_values     : category cardinality (drives the conditioning loops)
     """
 
     def __init__(self, triplets, feature_names, target_col, n_values,
@@ -61,70 +68,82 @@ class TripletConstraintsFn:
     def n_constraints(self):
         return max(1, len(self.triplets))
 
-    def _get_var(self, name, X_batch, y_batch):
-        """Float tensor for variable `name` from the current batch, or None."""
+    def _value(self, name, X, soft_val):
+        """Per-sample value vector for `name`.
+
+        Feature -> its data column. Target -> the model's expected category
+        E[target] = Σ_k k·p_k(x) (differentiable). None if the variable is
+        absent from the batch.
+        """
         if name == self.target_col:
-            return y_batch.float()
+            return soft_val
         idx = self._col_idx.get(name)
-        return X_batch[:, idx].float() if idx is not None else None
+        return X[:, idx].float() if idx is not None else None
 
-    def expectation(self, var_name, X_batch, y_batch, given=None):
-        """E(var_name) or E(var_name | given) computed from the batch.
+    def _weight(self, cond_name, cond_val, X, soft_probs):
+        """Per-sample conditioning weight for the event (cond_name == cond_val).
 
-        given: dict of {var_name: int_value} conditioning events, or None.
-        Returns a (1,) Tensor; zeros(1) when the conditioning set is empty.
+        Feature -> hard 0/1 indicator. Target -> predicted probability
+        p(target=cond_val | x) (so conditioning on the target stays
+        differentiable). None if the variable is absent.
         """
-        vals = self._get_var(var_name, X_batch, y_batch)
-        if vals is None:
+        if cond_name == self.target_col:
+            if cond_val >= soft_probs.shape[1]:
+                return torch.zeros(soft_probs.shape[0])
+            return soft_probs[:, cond_val]
+        idx = self._col_idx.get(cond_name)
+        if idx is None:
+            return None
+        return (X[:, idx].long() == int(cond_val)).float()
+
+    def _expect(self, value, given, X, soft_probs):
+        """Soft-weighted (conditional) mean Σ w·value / Σ w of `value`.
+
+        Hard 0/1 weights for feature conditioning, soft predicted probabilities
+        for target conditioning; a plain mean when `given` is empty. Returns a
+        (1,) Tensor (zeros when the conditioning set is empty/unsatisfiable).
+        """
+        w = torch.ones(value.shape[0])
+        if given:
+            for cond_name, cond_val in given.items():
+                wi = self._weight(cond_name, cond_val, X, soft_probs)
+                if wi is None:
+                    return torch.zeros(1)
+                w = w * wi
+        denom = w.sum()
+        if denom <= 1e-8:
             return torch.zeros(1)
-        if not given:
-            return vals.mean().unsqueeze(0)
-        mask = torch.ones(len(vals), dtype=torch.bool)
-        for cond_name, cond_val in given.items():
-            cond = self._get_var(cond_name, X_batch, y_batch)
-            if cond is None:
-                return torch.zeros(1)
-            mask &= cond.long() == int(cond_val)
-        return vals[mask].mean().unsqueeze(0) if mask.any() else torch.zeros(1)
+        return ((w * value).sum() / denom).unsqueeze(0)
 
-    def expectation_product(self, var1, var2, X_batch, y_batch, given=None):
-        """E(var1 * var2 | given) computed from the batch.
+    def expectation(self, var_name, X, soft_probs, soft_val, given=None):
+        """E(var_name) or E(var_name | given), target taken from the model."""
+        value = self._value(var_name, X, soft_val)
+        if value is None:
+            return torch.zeros(1)
+        return self._expect(value, given, X, soft_probs)
 
-        Same interface as expectation() but for the joint product of two variables.
-        Returns a (1,) Tensor; zeros(1) when conditioning set is empty or either
-        variable is absent from the batch.
-        """
-        v1 = self._get_var(var1, X_batch, y_batch)
-        v2 = self._get_var(var2, X_batch, y_batch)
+    def expectation_product(self, var1, var2, X, soft_probs, soft_val, given=None):
+        """E(var1 * var2 | given), same conventions as expectation()."""
+        v1 = self._value(var1, X, soft_val)
+        v2 = self._value(var2, X, soft_val)
         if v1 is None or v2 is None:
             return torch.zeros(1)
-        prod = v1 * v2
-        if not given:
-            return prod.mean().unsqueeze(0)
-        mask = torch.ones(len(prod), dtype=torch.bool)
-        for cond_name, cond_val in given.items():
-            cond = self._get_var(cond_name, X_batch, y_batch)
-            if cond is None:
-                return torch.zeros(1)
-            mask &= cond.long() == int(cond_val)
-        return prod[mask].mean().unsqueeze(0) if mask.any() else torch.zeros(1)
+        return self._expect(v1 * v2, given, X, soft_probs)
 
-    def _constraint_for_triplet(self, triplet, X_batch, y_batch):
-        """Scalar violation for one triplet.
+    def _constraint_for_triplet(self, triplet, X, soft_probs, soft_val):
+        """Scalar violation for one triplet (zero when the constraint holds).
 
-        Chain A→B→C: E(C|A=a, B=b) = E(C|B=b) for all (a,b).
-        Returns the mean squared difference across all (a,b) pairs —
-        zero when the constraint holds, positive otherwise.
-        Fork / collider: placeholder zeros (filled in later steps).
+        Expectations involving the target use the model's predicted class
+        distribution (soft_probs / soft_val); feature expectations use the data.
         """
         A, B, C = triplet.left, triplet.centre, triplet.right
         if triplet.type == TripletType.CHAIN:
             # chain A→B→C:  E(C|A=a, B=b) = E(C|B=b)  for all (a,b)
             total = torch.zeros(1)
             for b_val in range(self.n_values):
-                e_c_b = self.expectation(C, X_batch, y_batch, given={B: b_val})
+                e_c_b = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
                 for a_val in range(self.n_values):
-                    e_c_ab = self.expectation(C, X_batch, y_batch,
+                    e_c_ab = self.expectation(C, X, soft_probs, soft_val,
                                               given={A: a_val, B: b_val})
                     total = total + (e_c_ab - e_c_b) ** 2
             return total / self.n_values / self.n_values
@@ -133,10 +152,10 @@ class TripletConstraintsFn:
             # fork A←B→C:  E(A·C|B=b) = E(A|B=b)·E(C|B=b)  for all b
             total = torch.zeros(1)
             for b_val in range(self.n_values):
-                e_ac_b = self.expectation_product(A, C, X_batch, y_batch,
+                e_ac_b = self.expectation_product(A, C, X, soft_probs, soft_val,
                                                   given={B: b_val})
-                e_a_b  = self.expectation(A, X_batch, y_batch, given={B: b_val})
-                e_c_b  = self.expectation(C, X_batch, y_batch, given={B: b_val})
+                e_a_b  = self.expectation(A, X, soft_probs, soft_val, given={B: b_val})
+                e_c_b  = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
                 total  = total + (e_ac_b - e_a_b * e_c_b) ** 2
             return total / self.n_values
 
@@ -146,17 +165,17 @@ class TripletConstraintsFn:
             #   inequality: E(A·C|B=b) ≠ E(A|B=b)·E(C|B=b)  for all b
             #               encoded as hinge: max(0, τ − |difference|)
             # --- equality part ---
-            eq = (self.expectation_product(A, C, X_batch, y_batch)
-                  - self.expectation(A, X_batch, y_batch)
-                  * self.expectation(C, X_batch, y_batch)) ** 2
+            eq = (self.expectation_product(A, C, X, soft_probs, soft_val)
+                  - self.expectation(A, X, soft_probs, soft_val)
+                  * self.expectation(C, X, soft_probs, soft_val)) ** 2
 
             # --- inequality part: hinge over all b values ---
             hinge = torch.zeros(1)
             for b_val in range(self.n_values):
-                e_ac_b = self.expectation_product(A, C, X_batch, y_batch,
+                e_ac_b = self.expectation_product(A, C, X, soft_probs, soft_val,
                                                   given={B: b_val})
-                e_a_b  = self.expectation(A, X_batch, y_batch, given={B: b_val})
-                e_c_b  = self.expectation(C, X_batch, y_batch, given={B: b_val})
+                e_a_b  = self.expectation(A, X, soft_probs, soft_val, given={B: b_val})
+                e_c_b  = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
                 diff   = (e_ac_b - e_a_b * e_c_b).abs()
                 hinge  = hinge + torch.relu(self.collider_margin - diff)
             hinge = hinge / self.n_values
@@ -165,11 +184,22 @@ class TripletConstraintsFn:
 
         return torch.zeros(1)
 
-    def __call__(self, model, X_batch, y_batch):
+    def __call__(self, model, X_batch, y_batch=None):
+        """Per-triplet constraint violations of `model` on the batch.
+
+        The target variable is taken from the model's predicted class
+        distribution (softmax of model(X_batch)) rather than the labels, so the
+        violations are differentiable w.r.t. the model parameters and ALM can
+        actually steer the predictions. Feature variables come from the data.
+        `y_batch` is ignored (kept for call-site compatibility).
+        """
         if not self.triplets:
             return torch.zeros(1)
+        soft_probs = torch.softmax(model(X_batch), dim=1)
+        k = torch.arange(soft_probs.shape[1], dtype=soft_probs.dtype)
+        soft_val = (soft_probs * k).sum(dim=1)
         return torch.cat([
-            self._constraint_for_triplet(t, X_batch, y_batch)
+            self._constraint_for_triplet(t, X_batch, soft_probs, soft_val)
             for t in self.triplets
         ])
 
@@ -222,6 +252,10 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         n_constraints(int,   default 1)    number of constraints returned by constraints_fn
         alm_lr       (float, default 0.1)  dual variable learning rate
         alm_momentum (float, default 0.5)  dual variable momentum
+        alm_selection_weight (float, default 1.0) weight on the mean constraint
+            violation when picking the best epoch under constrained training;
+            the selection score is CE + alm_selection_weight * mean_violation
+            (plain training selects on CE alone).
     """
 
     def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
@@ -234,6 +268,7 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         self.cfg = cfg
         self.constraints_fn = constraints_fn
         self._rf_model_ = None
+        self._constraints_fn_ = None
         self._w_est = w_est
         self._classes = None
         self._feature_mask = None
@@ -286,6 +321,23 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             return X_arr[:, self._feature_mask]
         return np.zeros((X_arr.shape[0], 1), dtype=X_arr.dtype)
 
+    @staticmethod
+    def _infer_n_values(X_sel, n_classes):
+        """Single source of truth for category cardinality.
+
+        The data are ordinal with a cardinality shared across all variables
+        (see er_graph.generate_dag), so one integer serves every consumer: the
+        feature encoders/embeddings AND the constraint conditioning loops. It is
+        the larger of the max category index present in the selected features
+        (+1) and the number of target classes, so neither features nor target
+        can exceed it. Both fit() and constraint_violation() call this so the
+        constraint optimised during training and the one reported afterward loop
+        over exactly the same value range.
+        """
+        X_sel = np.asarray(X_sel)
+        feat_max = int(X_sel.max(initial=0)) + 1 if X_sel.size else 1
+        return max(feat_max, n_classes)
+
     # ------------------------------------------------------------------
     # training
     # ------------------------------------------------------------------
@@ -331,10 +383,35 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             self._feature_mask = list(range(len(feature_names)))
         self._kept_features = kept
 
-        # --- auto-inject TripletConstraintsFn when use_alm=True and no fn provided ---
-        if use_alm and self.constraints_fn is None:
-            y_arr = np.asarray(y)
-            n_values_inferred = int(y_arr.max()) + 1
+        # --- label encoding ---
+        y_np = np.asarray(y)
+        self._classes = np.unique(y_np)
+        label_to_idx = {c: i for i, c in enumerate(self._classes)}
+        y_enc = np.array([label_to_idx[c] for c in y_np], dtype=np.int64)
+
+        # --- tensors & dataloader (features restricted to self._feature_mask) ---
+        X_sel = self._select_features(np.asarray(X))
+        X_t = torch.tensor(X_sel, dtype=torch.float32)
+        y_t = torch.tensor(y_enc)
+        loader = DataLoader(TensorDataset(X_t, y_t),
+                            batch_size=batch_size, shuffle=True)
+
+        n_features = X_t.shape[1]
+        n_classes  = len(self._classes)
+        # --- single source of truth for category cardinality ---
+        # Inferred once here and reused by constraint_violation via the same
+        # _infer_n_values helper, so the encoders/embeddings and the constraint
+        # conditioning loops all agree (and training matches reporting).
+        n_values = self._infer_n_values(X_sel, n_classes)
+
+        # --- resolve the constraints function (never mutate the ctor param) ---
+        # When ALM is on and the user passed none, auto-build a
+        # TripletConstraintsFn. The result lives in the fitted attribute
+        # self._constraints_fn_, leaving the constructor argument
+        # self.constraints_fn untouched, so sklearn clone()/get_params and any
+        # re-fit keep re-deriving from the original input.
+        constraints_fn = self.constraints_fn
+        if use_alm and constraints_fn is None:
             triplets = self.get_target_triplets()
             if restrict_mode != 'none':
                 # A constraint over an excluded variable is meaningless for a
@@ -343,34 +420,17 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 allowed = set(kept) | {self.target_col}
                 triplets = [tr for tr in triplets
                             if {tr.left, tr.centre, tr.right} <= allowed]
-            self.constraints_fn = TripletConstraintsFn(
-                triplets, kept, self.target_col, n_values_inferred
+            constraints_fn = TripletConstraintsFn(
+                triplets, kept, self.target_col, n_values
             )
+        self._constraints_fn_ = constraints_fn
 
         # Determine the dual dimension AFTER the constraints function exists, so
         # every constraint it returns gets its own dual variable in the ALM.
-        n_constraints = getattr(self.constraints_fn, 'n_constraints',
+        n_constraints = getattr(constraints_fn, 'n_constraints',
                                 self.cfg.get('n_constraints', 1))
 
-        # --- label encoding ---
-        y_np = np.asarray(y)
-        self._classes = np.unique(y_np)
-        label_to_idx = {c: i for i, c in enumerate(self._classes)}
-        y_enc = np.array([label_to_idx[c] for c in y_np], dtype=np.int64)
-
-        # --- tensors & dataloader (features restricted to self._feature_mask) ---
-        X_t = torch.tensor(self._select_features(np.asarray(X)),
-                           dtype=torch.float32)
-        y_t = torch.tensor(y_enc)
-        loader = DataLoader(TensorDataset(X_t, y_t),
-                            batch_size=batch_size, shuffle=True)
-
         # --- build network ---
-        n_features = X_t.shape[1]
-        n_classes  = len(self._classes)
-        # category cardinality for encoders/embeddings: max index over the
-        # features (plus 1). Raw-float backbones ignore it.
-        n_values = int(X_t.max().item()) + 1 if X_t.numel() else 1
         network_name = self.cfg.get('network', 'mlp')
         model = build_network(network_name, n_features, n_classes, n_values, self.cfg)
         criterion = nn.CrossEntropyLoss()
@@ -394,7 +454,13 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         # constrained variants because it is the underlying prediction
         # objective and is comparable across epochs (unlike the Lagrangian,
         # whose value shifts as the dual variables update).
-        best_loss = float('inf')
+        # Constrained training selects on CE + sel_weight * mean violation so the
+        # returned epoch is not the one that fits the data hardest while breaking
+        # the causal facts. A fixed sel_weight (rather than the shifting dual
+        # variables) keeps the score comparable across epochs; plain training
+        # falls back to CE alone.
+        sel_weight = self.cfg.get('alm_selection_weight', 1.0)
+        best_score = float('inf')
         best_state = copy.deepcopy(model.state_dict())
         for _ in range(n_epochs):
             model.train()
@@ -402,9 +468,9 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 logits = model(X_batch)
                 loss = criterion(logits, y_batch)
 
-                if dual is not None and self.constraints_fn is not None:
+                if dual is not None and self._constraints_fn_ is not None:
                     # constrained update via Augmented Lagrangian
-                    constraints = self.constraints_fn(model, X_batch, y_batch)
+                    constraints = self._constraints_fn_(model, X_batch, y_batch)
                     lagrangian = dual.forward_update(loss, constraints)
                     lagrangian.backward()
                 else:
@@ -413,12 +479,14 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # --- model selection: track lowest training cross-entropy ---
+            # --- model selection: CE, plus constraint violation when constrained ---
             model.eval()
             with torch.no_grad():
-                epoch_loss = criterion(model(X_t), y_t).item()
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
+                score = criterion(model(X_t), y_t).item()
+                if dual is not None and self._constraints_fn_ is not None:
+                    score += sel_weight * self._constraints_fn_(model, X_t).mean().item()
+            if score < best_score:
+                best_score = score
                 best_state = copy.deepcopy(model.state_dict())
 
         model.load_state_dict(best_state)
@@ -458,21 +526,22 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         """
         if self._rf_model_ is None:
             raise RuntimeError("call fit() before constraint_violation()")
-        triplets = self.get_target_triplets()
+        # Evaluate over exactly the features the model was trained on (the same
+        # construction as fit): triplets whose variables all survive, feature
+        # names = the kept columns, X selected through the fitted mask.
+        feature_names = list(self._kept_features or [])
+        allowed = set(feature_names) | {self.target_col}
+        triplets = [t for t in self.get_target_triplets()
+                    if {t.left, t.centre, t.right} <= allowed]
         if not triplets:
             return {'total': 0.0, 'per_triplet': [], 'n_triplets': 0}
-        feature_names = (list(X.columns) if hasattr(X, 'columns')
-                         else [n for n in self.row_and_col_names
-                               if n != self.target_col])
-        X_arr = np.asarray(X)
-        preds = np.asarray(self.predict(X))
-        n_values = int(max(X_arr.max(initial=0), preds.max(initial=0))) + 1
+        X_sel = self._select_features(np.asarray(X))
+        n_values = self._infer_n_values(X_sel, len(self._classes))
         cfn = TripletConstraintsFn(triplets, feature_names,
                                    self.target_col, n_values)
         with torch.no_grad():
             viol = cfn(self._rf_model_,
-                       torch.tensor(X_arr, dtype=torch.float32),
-                       torch.tensor(preds)).detach().cpu().numpy()
+                       torch.tensor(X_sel, dtype=torch.float32)).detach().cpu().numpy()
         total = float(viol.mean() if aggregate == 'mean' else viol.sum())
         return {'total': total, 'per_triplet': viol.tolist(),
                 'n_triplets': len(triplets)}
