@@ -100,34 +100,43 @@ class TripletConstraintsFn:
         """Soft-weighted (conditional) mean Σ w·value / Σ w of `value`.
 
         Hard 0/1 weights for feature conditioning, soft predicted probabilities
-        for target conditioning; a plain mean when `given` is empty. Returns a
-        (1,) Tensor (zeros when the conditioning set is empty/unsatisfiable).
+        for target conditioning; a plain mean when `given` is empty. Returns
+        None when the conditioning cell is unsatisfiable -- a needed variable is
+        absent from the batch, or no probability mass / no samples fall in the
+        cell (denom <= 1e-8). Returning None (rather than a phantom zero) lets
+        the caller SKIP empty cells instead of counting (0 - E[...])^2 as a fake
+        violation.
         """
         w = torch.ones(value.shape[0])
         if given:
             for cond_name, cond_val in given.items():
                 wi = self._weight(cond_name, cond_val, X, soft_probs)
                 if wi is None:
-                    return torch.zeros(1)
+                    return None
                 w = w * wi
         denom = w.sum()
         if denom <= 1e-8:
-            return torch.zeros(1)
+            return None
         return ((w * value).sum() / denom).unsqueeze(0)
 
     def expectation(self, var_name, X, soft_probs, soft_val, given=None):
-        """E(var_name) or E(var_name | given), target taken from the model."""
+        """E(var_name) or E(var_name | given), target taken from the model.
+
+        Returns None when the variable is absent or the conditioning cell is
+        empty/unsatisfiable, so callers can skip it.
+        """
         value = self._value(var_name, X, soft_val)
         if value is None:
-            return torch.zeros(1)
+            return None
         return self._expect(value, given, X, soft_probs)
 
     def expectation_product(self, var1, var2, X, soft_probs, soft_val, given=None):
-        """E(var1 * var2 | given), same conventions as expectation()."""
+        """E(var1 * var2 | given), same conventions (and None semantics) as
+        expectation()."""
         v1 = self._value(var1, X, soft_val)
         v2 = self._value(var2, X, soft_val)
         if v1 is None or v2 is None:
-            return torch.zeros(1)
+            return None
         return self._expect(v1 * v2, given, X, soft_probs)
 
     def _constraint_for_triplet(self, triplet, X, soft_probs, soft_val):
@@ -135,50 +144,75 @@ class TripletConstraintsFn:
 
         Expectations involving the target use the model's predicted class
         distribution (soft_probs / soft_val); feature expectations use the data.
+
+        Conditioning cells that are empty/unsatisfiable on this batch are
+        SKIPPED (they contribute to neither the sum nor the term count) rather
+        than counted as a phantom zero, so a missing (a, b) combination cannot
+        inject a fake "(0 - E[...])^2" violation or push its gradient onto the
+        samples in the other, populated cells. The average is taken over the
+        number of VALID terms (>= 1 to avoid division by zero).
         """
         A, B, C = triplet.left, triplet.centre, triplet.right
         if triplet.type == TripletType.CHAIN:
             # chain A→B→C:  E(C|A=a, B=b) = E(C|B=b)  for all (a,b)
             total = torch.zeros(1)
+            n_terms = 0
             for b_val in range(self.n_values):
                 e_c_b = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
+                if e_c_b is None:                       # cell B=b empty -> skip
+                    continue
                 for a_val in range(self.n_values):
                     e_c_ab = self.expectation(C, X, soft_probs, soft_val,
                                               given={A: a_val, B: b_val})
+                    if e_c_ab is None:                  # cell (a, b) empty -> skip
+                        continue
                     total = total + (e_c_ab - e_c_b) ** 2
-            return total / self.n_values / self.n_values
+                    n_terms += 1
+            return total / max(1, n_terms)
 
         if triplet.type == TripletType.FORK:
             # fork A←B→C:  E(A·C|B=b) = E(A|B=b)·E(C|B=b)  for all b
             total = torch.zeros(1)
+            n_terms = 0
             for b_val in range(self.n_values):
                 e_ac_b = self.expectation_product(A, C, X, soft_probs, soft_val,
                                                   given={B: b_val})
                 e_a_b  = self.expectation(A, X, soft_probs, soft_val, given={B: b_val})
                 e_c_b  = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
-                total  = total + (e_ac_b - e_a_b * e_c_b) ** 2
-            return total / self.n_values
+                if e_ac_b is None or e_a_b is None or e_c_b is None:
+                    continue                            # cell B=b empty -> skip
+                total = total + (e_ac_b - e_a_b * e_c_b) ** 2
+                n_terms += 1
+            return total / max(1, n_terms)
 
         if triplet.type == TripletType.COLLIDER:
             # collider A→B←C:
             #   equality  : E(A·C) = E(A)·E(C)          (marginal independence)
             #   inequality: E(A·C|B=b) ≠ E(A|B=b)·E(C|B=b)  for all b
             #               encoded as hinge: max(0, τ − |difference|)
-            # --- equality part ---
-            eq = (self.expectation_product(A, C, X, soft_probs, soft_val)
-                  - self.expectation(A, X, soft_probs, soft_val)
-                  * self.expectation(C, X, soft_probs, soft_val)) ** 2
+            # --- equality part (marginal; only skipped if A or C is absent) ---
+            e_ac = self.expectation_product(A, C, X, soft_probs, soft_val)
+            e_a  = self.expectation(A, X, soft_probs, soft_val)
+            e_c  = self.expectation(C, X, soft_probs, soft_val)
+            if e_ac is None or e_a is None or e_c is None:
+                eq = torch.zeros(1)
+            else:
+                eq = (e_ac - e_a * e_c) ** 2
 
-            # --- inequality part: hinge over all b values ---
+            # --- inequality part: hinge over valid b cells only ---
             hinge = torch.zeros(1)
+            n_terms = 0
             for b_val in range(self.n_values):
                 e_ac_b = self.expectation_product(A, C, X, soft_probs, soft_val,
                                                   given={B: b_val})
                 e_a_b  = self.expectation(A, X, soft_probs, soft_val, given={B: b_val})
                 e_c_b  = self.expectation(C, X, soft_probs, soft_val, given={B: b_val})
+                if e_ac_b is None or e_a_b is None or e_c_b is None:
+                    continue                            # cell B=b empty -> skip
                 diff   = (e_ac_b - e_a_b * e_c_b).abs()
                 hinge  = hinge + torch.relu(self.collider_margin - diff)
-            hinge = hinge / self.n_values
+                n_terms += 1
+            hinge = hinge / max(1, n_terms)
 
             return eq + hinge
 
