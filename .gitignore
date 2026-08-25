@@ -8,3 +8,4 @@ data/energy_expenditure
 .claude
 test_all_features.py
 .claude/*
+.claude/settings.local.json

@@ -18,13 +18,20 @@ giving six settings per backbone:
     uncon_mb    vanilla,     Markov blanket
     con_mb      constrained, Markov blanket
 
-Backbone -> (unconstrained config, constrained config):
+giving a seventh setting, uncon_ME, which isolates the effect of swapping in
+the Moreau-envelope-smoothed optimizer alone (same "all features", no ALM
+duals/constraints) -- a control for how much of con_all's effect (if any) is
+just "different optimizer" rather than "causal constraint":
 
-    mlp           -> discrete                / discrete_constrained
-    deep_mlp      -> discrete_deep           / discrete_deep_constrained
-    onehot_mlp    -> discrete_onehot         / discrete_onehot_constrained
-    embedding_mlp -> discrete_embedding      / discrete_embedding_constrained
-    transformer   -> discrete_transformer    / discrete_transformer_constrained
+    uncon_ME    vanilla + Moreau-envelope optimizer, all features
+
+Backbone -> (unconstrained config, constrained config, Moreau-only config):
+
+    mlp           -> discrete             / discrete_constrained             / discrete_me
+    deep_mlp      -> discrete_deep        / discrete_deep_constrained        / discrete_deep_me
+    onehot_mlp    -> discrete_onehot      / discrete_onehot_constrained      / discrete_onehot_me
+    embedding_mlp -> discrete_embedding   / discrete_embedding_constrained   / discrete_embedding_me
+    transformer   -> discrete_transformer / discrete_transformer_constrained / discrete_transformer_me
 
 Every (backbone, setting, target) is evaluated on N_SEEDS independently
 generated er_graph datasets. Results are written to:
@@ -74,21 +81,25 @@ logging.basicConfig(level=logging.WARNING)
 
 CONF_DIR = Path(__file__).parent / "experiments_conf"
 
-# (label, unconstrained solver config, constrained solver config)
+# (label, unconstrained solver config, constrained solver config,
+#  Moreau-envelope-only solver config)
 NETWORKS = [
-    ("mlp",           "discrete",             "discrete_constrained"),
-    ("deep_mlp",      "discrete_deep",        "discrete_deep_constrained"),
-    ("onehot_mlp",    "discrete_onehot",      "discrete_onehot_constrained"),
-    ("embedding_mlp", "discrete_embedding",   "discrete_embedding_constrained"),
-    ("transformer",   "discrete_transformer", "discrete_transformer_constrained"),
+    ("mlp",           "discrete",             "discrete_constrained",             "discrete_me"),
+    ("deep_mlp",      "discrete_deep",        "discrete_deep_constrained",        "discrete_deep_me"),
+    ("onehot_mlp",    "discrete_onehot",      "discrete_onehot_constrained",      "discrete_onehot_me"),
+    ("embedding_mlp", "discrete_embedding",   "discrete_embedding_constrained",   "discrete_embedding_me"),
+    ("transformer",   "discrete_transformer", "discrete_transformer_constrained", "discrete_transformer_me"),
 ]
 
 # (setting label, which config variant, feature-restriction mode)
+#   variant: 'uncon' = vanilla Adam, 'con' = ALM-constrained, 'me' = vanilla
+#            but with the Moreau-envelope optimizer (no constraints)
 #   mode: 'none' = all features, 'parents' = direct causes only,
 #         'markov_blanket' = parents + children + co-parents
 SETTINGS = [
     ("uncon_all", "uncon", "none"),
     ("con_all",   "con",   "none"),
+    ("uncon_ME",  "me",    "none"),
 #    ("uncon_par", "uncon", "parents"),
 #    ("con_par",   "con",   "parents"),
     ("uncon_mb",  "uncon", "markov_blanket"),
@@ -251,9 +262,10 @@ def main():
 
     # pre-load all solver configs (one per variant per backbone)
     solvers = {}  # (label, variant) -> cfg
-    for label, uncon, con in nets:
+    for label, uncon, con, me in nets:
         solvers[(label, "uncon")] = load_solver(uncon, args.n_epochs, args.n_runs)
         solvers[(label, "con")] = load_solver(con, args.n_epochs, args.n_runs)
+        solvers[(label, "me")] = load_solver(me, args.n_epochs, args.n_runs)
 
     seeds = [args.seed] if args.seed is not None else list(range(args.n_seeds))
     n_runs_eff = solvers[(net_labels[0], "uncon")].n_runs

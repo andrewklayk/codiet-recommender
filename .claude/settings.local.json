@@ -8,7 +8,11 @@
       "Bash(ls \"C:\\\\Users\\\\petrr\\\\Documents\\\\codiet\\\\recommender\\\\codiet_recommender2\" && ls \"C:\\\\Users\\\\petrr\\\\Documents\\\\codiet\\\\recommender\\\\results\\\\20260628-afterfix\")",
       "PowerShell($roots = @\\(\"$env:USERPROFILE\\\\.virtualenvs\", \"$env:LOCALAPPDATA\\\\pypoetry\", \"$env:USERPROFILE\\\\venvs\", \"$env:USERPROFILE\\\\Envs\", \"$env:USERPROFILE\\\\PycharmProjects\"\\); foreach \\($r in $roots\\) { if \\(Test-Path $r\\) { Write-Output \"EXISTS: $r\"; Get-ChildItem $r -Directory | Select-Object -First 20 Name } }; Write-Output \"---JDKTABLE---\"; $jdk = Get-ChildItem \"$env:APPDATA\\\\JetBrains\" -Recurse -Filter \"jdk.table.xml\" -ErrorAction SilentlyContinue | Select-Object -First 3 FullName; $jdk; if \\($jdk\\) { Select-String -Path $jdk[0].FullName -Pattern \"exmag\" -Context 2,6 | Select-Object -First 5 })",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\petrr\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-petrr-Documents-codiet-recommender-codiet-recommender2\\\\0912040f-82aa-40a7-9d3e-f294a99d65ed\\\\scratchpad\" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Output \"$\\($_.Name\\) | $\\($_.Length\\) | $\\($_.LastWriteTime\\)\" })",
-      "PowerShell($sp = \"C:\\\\Users\\\\petrr\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-petrr-Documents-codiet-recommender-codiet-recommender2\\\\0912040f-82aa-40a7-9d3e-f294a99d65ed\\\\scratchpad\"; Get-Content \"$sp\\\\ablation_results.csv\")"
+      "PowerShell($sp = \"C:\\\\Users\\\\petrr\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-petrr-Documents-codiet-recommender-codiet-recommender2\\\\0912040f-82aa-40a7-9d3e-f294a99d65ed\\\\scratchpad\"; Get-Content \"$sp\\\\ablation_results.csv\")",
+      "Bash(ls -la \"C:/Users/petrr/Documents/codiet/recommender/results/20260722-fixesfable/\")",
+      "Bash(C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe -c ' *)",
+      "Bash(cd \"C:/Users/petrr/Documents/venvs_python/exmag/Lib/site-packages/humancompatible/train\" 2>/dev/null && ls && sed -n '1,160p' dual_optim.py)",
+      "Bash(PYTHONPATH=\"C:/Users/petrr/Documents/codiet/recommender/codiet_recommender2\" \"C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe\" \"C:/Users/petrr/AppData/Local/Temp/claude/C--Users-petrr-Documents-codiet-recommender-codiet-recommender2/0bc1fb28-5d70-4c8b-892c-1d74f92e2955/scratchpad/probe.py\")"
     ]
   }
 }

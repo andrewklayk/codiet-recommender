@@ -1,11 +1,11 @@
-name: discrete_constrained
+name: discrete_me
 model_name: DISC
 custom_objective: none
 #N_SELECT_FEATURES: 5
 n_runs: 5
 recalculate_dag: false
 
-#feature_selector: null   # skip SFS — train once on all features with ALM
+#feature_selector: SequentialFeatureSelector
 
 # neural network architecture
 # backbone: mlp | deep_mlp | onehot_mlp | embedding_mlp | transformer
@@ -31,12 +31,13 @@ learning_rate: 0.001
 restrict_to_parents: false
 restrict_to_markov_blanket: false
 
-# constrained training via humancompatible/train (pip install humancompatible-train)
-use_alm: true
-alm_lr: 5.0          # duals stepped once per epoch on the full-train violation
-alm_penalty: 1.0     # ALM quadratic-penalty coefficient
-alm_slack: 0.01      # step duals on (violation - slack) so they can decrease
-alm_momentum: 0.5
+# Moreau-envelope smoothing ALONE, no ALM duals/constraints: isolates the
+# effect of the optimizer from the effect of the causal constraints (use_alm
+# stays false here -- this is the "uncon_ME" ablation).
+use_alm: false
+use_moreau: true
+moreau_mu: 2.0
+moreau_beta: 0.5
 
 # debugging
 debug: false

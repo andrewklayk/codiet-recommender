@@ -14,6 +14,9 @@ run for all five network backbones:
     baseline   unconstrained, features = direct PARENTS of the target only
                (the naive "from A->B->T keep only B" baseline)
     constr_all constrained (ALM),  features = ALL other variables
+    uncon_ME   unconstrained + Moreau-envelope optimizer, features = ALL other
+               variables (isolates the optimizer's own effect from the causal
+               constraint's effect -- a control for constr_all)
     dsep_uncon unconstrained,      features = the target's MARKOV BLANKET
                (the vertices with predictive power according to d-separation:
                 parents + children + co-parents)
@@ -23,6 +26,8 @@ The point: the naive baseline fixes the feature set from the parents alone and
 fails whenever the target has no parents (e.g. the root of a chain) even though
 descendants are predictive; the constrained estimator on the full feature set,
 and the d-separation feature sets, should recover the predictive signal.
+uncon_ME checks that any improvement from constr_all is not simply an artifact
+of training with the Moreau-envelope-wrapped optimizer.
 
 The estimator is NOT modified: the parents-only restriction reuses the existing
 `restrict_to_parents` flag, and the Markov-blanket restriction is applied at the
@@ -76,10 +81,13 @@ STRUCTURES = {
 }
 
 # (label, config variant, restrict_to_parents, feature set)
+#   variant: 'uncon' = vanilla Adam, 'con' = ALM-constrained, 'me' = vanilla
+#            but with the Moreau-envelope optimizer (no constraints)
 #   feature set: 'all' = every other variable, 'mb' = Markov blanket
 METHODS = [
     ("baseline",   "uncon", True,  "all"),   # parents-only, naive baseline
     ("constr_all", "con",   False, "all"),   # constraints on all features
+    ("uncon_ME",   "me",    False, "all"),   # optimizer-only control, all features
     ("dsep_uncon", "uncon", False, "mb"),    # Markov-blanket, no constraints
     ("dsep_con",   "con",   False, "mb"),    # Markov-blanket, constraints
 ]
@@ -167,11 +175,12 @@ def main():
             raise SystemExit(f"No backbones match {wanted}")
     net_labels = [n[0] for n in nets]
 
-    # pre-load each backbone's unconstrained / constrained config once
+    # pre-load each backbone's unconstrained / constrained / Moreau-only config
     solvers = {}
-    for label, uncon, con in nets:
+    for label, uncon, con, me in nets:
         solvers[(label, "uncon")] = load_solver(uncon, args.n_epochs, args.n_runs)
         solvers[(label, "con")] = load_solver(con, args.n_epochs, args.n_runs)
+        solvers[(label, "me")] = load_solver(me, args.n_epochs, args.n_runs)
 
     seeds = [args.seed] if args.seed is not None else list(range(args.n_seeds))
     n_runs_eff = solvers[(net_labels[0], "uncon")].n_runs

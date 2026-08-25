@@ -1,0 +1,31 @@
+name: discrete_deep_me
+model_name: DISC
+custom_objective: none
+#N_SELECT_FEATURES: 5
+n_runs: 5
+recalculate_dag: false
+
+#feature_selector: SequentialFeatureSelector
+
+# neural network architecture
+# backbone: mlp | deep_mlp | onehot_mlp | embedding_mlp | transformer
+network: deep_mlp
+hidden_dim: 128
+n_layers: 4
+dropout: 0.1
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# Moreau-envelope smoothing ALONE, no ALM duals/constraints: isolates the
+# effect of the optimizer from the effect of the causal constraints (use_alm
+# stays false here -- this is the "uncon_ME" ablation).
+use_alm: false
+use_moreau: true
+moreau_mu: 2.0
+moreau_beta: 0.5
+
+# debugging
+debug: false

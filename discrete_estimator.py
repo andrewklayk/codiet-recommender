@@ -62,6 +62,9 @@ class TripletConstraintsFn:
         self.target_col = target_col
         self.n_values = n_values
         self.collider_margin = collider_margin
+        # per-triplet hinge margins, keyed by the (frozen) Triplet; set by
+        # calibrate_collider_margins(). Empty -> fall back to collider_margin.
+        self._collider_margins = {}
         self._col_idx = {name: i for i, name in enumerate(self.feature_names)}
 
     @property
@@ -190,16 +193,25 @@ class TripletConstraintsFn:
             #   equality  : E(A·C) = E(A)·E(C)          (marginal independence)
             #   inequality: E(A·C|B=b) ≠ E(A|B=b)·E(C|B=b)  for all b
             #               encoded as hinge: max(0, τ − |difference|)
-            # --- equality part (marginal; only skipped if A or C is absent) ---
-            e_ac = self.expectation_product(A, C, X, soft_probs, soft_val)
-            e_a  = self.expectation(A, X, soft_probs, soft_val)
-            e_c  = self.expectation(C, X, soft_probs, soft_val)
-            if e_ac is None or e_a is None or e_c is None:
-                eq = torch.zeros(1)
+            # --- equality part (marginal independence of the endpoints) ---
+            # Only meaningful when it depends on the model, i.e. when an endpoint
+            # is the target. If the centre is the target, both endpoints are
+            # feature columns, so this term is a constant fact about the data
+            # (zero gradient) -- skip it so it neither inflates the reported
+            # violation nor feeds the ALM dual ratchet.
+            if self.target_col in (A, C):
+                e_ac = self.expectation_product(A, C, X, soft_probs, soft_val)
+                e_a  = self.expectation(A, X, soft_probs, soft_val)
+                e_c  = self.expectation(C, X, soft_probs, soft_val)
+                eq = (torch.zeros(1) if (e_ac is None or e_a is None or e_c is None)
+                      else (e_ac - e_a * e_c) ** 2)
             else:
-                eq = (e_ac - e_a * e_c) ** 2
+                eq = torch.zeros(1)
 
             # --- inequality part: hinge over valid b cells only ---
+            # Per-triplet margin (calibrated from the data's achievable
+            # dependence) if available, else the fixed default.
+            margin = self._collider_margins.get(triplet, self.collider_margin)
             hinge = torch.zeros(1)
             n_terms = 0
             for b_val in range(self.n_values):
@@ -210,13 +222,53 @@ class TripletConstraintsFn:
                 if e_ac_b is None or e_a_b is None or e_c_b is None:
                     continue                            # cell B=b empty -> skip
                 diff   = (e_ac_b - e_a_b * e_c_b).abs()
-                hinge  = hinge + torch.relu(self.collider_margin - diff)
+                hinge  = hinge + torch.relu(margin - diff)
                 n_terms += 1
             hinge = hinge / max(1, n_terms)
 
             return eq + hinge
 
         return torch.zeros(1)
+
+    def calibrate_collider_margins(self, X_full, y_full, fraction=0.5):
+        """Set each collider triplet's hinge margin from the ACHIEVABLE dependence.
+
+        The hinge max(0, margin - |dep|) asks the model to induce conditional
+        dependence between a collider's endpoints of at least `margin`. A fixed
+        margin can exceed the dependence the true collider actually produces
+        (which depends on the CPTs and may be smaller than sampling noise),
+        making the constraint unsatisfiable and the ALM dual grow without bound.
+
+        We therefore estimate the achievable dependence from the TRUE labels --
+        |E[A·C|B=b] - E[A|B=b]·E[C|B=b]| averaged over the populated b cells,
+        computed by feeding the one-hot true target through the same expectation
+        machinery -- and set each collider's margin to `fraction` of it (floored
+        at 0). Data-only: call once on the full training set. Returns the
+        {triplet: margin} map (also stored on self).
+        """
+        X = torch.as_tensor(np.asarray(X_full), dtype=torch.float32)
+        y = torch.as_tensor(np.asarray(y_full)).long()
+        n = y.shape[0]
+        probs = torch.zeros(n, self.n_values)                 # true label one-hot
+        probs[torch.arange(n), y.clamp(0, self.n_values - 1)] = 1.0
+        val = y.float()                                       # true target values
+        margins = {}
+        for t in self.triplets:
+            if t.type != TripletType.COLLIDER:
+                continue
+            A, B, C = t.left, t.centre, t.right
+            deps = []
+            for b_val in range(self.n_values):
+                e_ac = self.expectation_product(A, C, X, probs, val, given={B: b_val})
+                e_a  = self.expectation(A, X, probs, val, given={B: b_val})
+                e_c  = self.expectation(C, X, probs, val, given={B: b_val})
+                if e_ac is None or e_a is None or e_c is None:
+                    continue
+                deps.append((e_ac - e_a * e_c).abs().item())
+            emp = sum(deps) / len(deps) if deps else 0.0
+            margins[t] = max(0.0, fraction * emp)
+        self._collider_margins = margins
+        return margins
 
     def __call__(self, model, X_batch, y_batch=None):
         """Per-triplet constraint violations of `model` on the batch.
@@ -284,12 +336,47 @@ class DiscreteRecommenderPredictor(BaseEstimator):
     ALM hyper-parameters (read from cfg, used only when use_alm=True):
         use_alm      (bool,  default False)
         n_constraints(int,   default 1)    number of constraints returned by constraints_fn
-        alm_lr       (float, default 0.1)  dual variable learning rate
+        alm_lr       (float, default 5.0)  dual variable learning rate. The duals
+            are updated ONCE PER EPOCH on the full training set (not per
+            minibatch), so with honestly-measured violations the classic small
+            step is far too weak; 5.0 matches the Markov-blanket oracle here.
+        alm_penalty  (float, default 1.0)  ALM quadratic-penalty coefficient
+            (the `penalty` arg of humancompatible ALM).
+        alm_slack    (float, default 0.01) tolerance subtracted from the
+            full-train violation before the dual update, i.e. duals step on
+            (violation - alm_slack). This lets duals DECREASE when violations are
+            within estimation noise, breaking the monotone ratchet that arises
+            because constraints are nonnegative by construction.
         alm_momentum (float, default 0.5)  dual variable momentum
+        collider_margin_fraction (float, default 0.5) sets each collider's hinge
+            margin to this fraction of the endpoint dependence achievable in the
+            true training labels (see
+            TripletConstraintsFn.calibrate_collider_margins), so the constraint
+            is not asked to manufacture more dependence than the data holds.
         alm_selection_weight (float, default 1.0) weight on the mean constraint
             violation when picking the best epoch under constrained training;
-            the selection score is CE + alm_selection_weight * mean_violation
-            (plain training selects on CE alone).
+            the selection score is CE + alm_selection_weight * mean_violation,
+            with the violation measured on the full training set (the same
+            evaluation used for the dual update). Plain training selects on CE
+            alone.
+
+    Moreau-envelope-only hyper-parameters (read from cfg, used only when
+    use_moreau=True; ignored if use_alm=True, which already wraps Adam in
+    MoreauEnvelope alongside the ALM duals):
+        use_moreau   (bool,  default False) wrap Adam in
+            humancompatible.train.dual_optim.MoreauEnvelope with no dual
+            variables or constraints -- isolates the effect of the optimizer
+            alone from the effect of the causal constraint (the "uncon_ME"
+            ablation in test_all_networks.py / test_constraints.py /
+            test_shift.py).
+        moreau_mu    (float, default 2.0)  smoothing multiplier
+        moreau_beta  (float, default 0.5)  smoothing multiplier update rate
+
+    Dual-update scheme: per minibatch we backprop the Lagrangian via
+    dual.forward(loss, constraints) WITHOUT stepping the duals; once per epoch we
+    evaluate the constraints on the whole training set and call
+    dual.update(violation - alm_slack). This decouples the (noisy, per-batch)
+    primal gradient from the (stable, per-epoch) dual dynamics.
     """
 
     def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
@@ -384,8 +471,16 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         batch_size    = self.cfg.get('batch_size',    32)
         lr            = self.cfg.get('learning_rate', 1e-3)
         use_alm       = self.cfg.get('use_alm',       False)
-        alm_lr        = self.cfg.get('alm_lr',        0.1)
+        alm_lr        = self.cfg.get('alm_lr',        5.0)
+        alm_penalty   = self.cfg.get('alm_penalty',   1.0)
+        alm_slack     = self.cfg.get('alm_slack',     0.01)
         alm_momentum  = self.cfg.get('alm_momentum',  0.5)
+        # Moreau-envelope smoothing on its own (no ALM dual/constraints): isolates
+        # the effect of the optimizer alone from the effect of the causal
+        # constraints, for the uncon_ME ablation.
+        use_moreau    = self.cfg.get('use_moreau',    False)
+        moreau_mu     = self.cfg.get('moreau_mu',     2.0)
+        moreau_beta   = self.cfg.get('moreau_beta',   0.5)
 
         # --- resolve the feature-restriction mode (interaction-graph baseline) ---
         # 'markov_blanket' keeps parents + children + co-parents; 'parents' keeps
@@ -459,6 +554,14 @@ class DiscreteRecommenderPredictor(BaseEstimator):
             )
         self._constraints_fn_ = constraints_fn
 
+        # Calibrate collider hinge margins from the achievable dependence in the
+        # TRUE training labels, so the constraint never asks for more conditional
+        # dependence than the data actually contains (else the dual diverges).
+        if use_alm and isinstance(self._constraints_fn_, TripletConstraintsFn):
+            margin_fraction = self.cfg.get('collider_margin_fraction', 0.5)
+            self._constraints_fn_.calibrate_collider_margins(
+                X_sel, y_enc, margin_fraction)
+
         # Determine the dual dimension AFTER the constraints function exists, so
         # every constraint it returns gets its own dual variable in the ALM.
         n_constraints = getattr(constraints_fn, 'n_constraints',
@@ -469,13 +572,22 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         model = build_network(network_name, n_features, n_classes, n_values, self.cfg)
         criterion = nn.CrossEntropyLoss()
 
-        # --- optimiser (plain or ALM-wrapped) ---
+        # --- optimiser (plain, Moreau-only, or ALM-wrapped) ---
         if use_alm:
             # humancompatible/train integration:
             # pip install humancompatible-train
             from humancompatible.train.dual_optim import ALM, MoreauEnvelope
             optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr))
-            dual = ALM(m=n_constraints, lr=alm_lr, momentum=alm_momentum)
+            dual = ALM(m=n_constraints, lr=alm_lr, momentum=alm_momentum,
+                       penalty=alm_penalty)
+        elif use_moreau:
+            # Same optimizer wrapper as ALM training, but with no dual variables
+            # or constraints: measures what the Moreau-envelope smoothing alone
+            # contributes, decoupled from the causal-constraint penalty.
+            from humancompatible.train.dual_optim import MoreauEnvelope
+            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr),
+                                       mu=moreau_mu, beta=moreau_beta)
+            dual = None
         else:
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             dual = None
@@ -494,6 +606,7 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         # variables) keeps the score comparable across epochs; plain training
         # falls back to CE alone.
         sel_weight = self.cfg.get('alm_selection_weight', 1.0)
+        constrained = dual is not None and self._constraints_fn_ is not None
         best_score = float('inf')
         best_state = copy.deepcopy(model.state_dict())
         for _ in range(n_epochs):
@@ -502,10 +615,13 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 logits = model(X_batch)
                 loss = criterion(logits, y_batch)
 
-                if dual is not None and self._constraints_fn_ is not None:
-                    # constrained update via Augmented Lagrangian
+                if constrained:
+                    # Backprop the Lagrangian with the duals held FIXED for the
+                    # epoch (forward, not forward_update): the per-minibatch
+                    # constraint estimate is noisy and, being nonnegative, would
+                    # ratchet the duals upward every step.
                     constraints = self._constraints_fn_(model, X_batch, y_batch)
-                    lagrangian = dual.forward_update(loss, constraints)
+                    lagrangian = dual.forward(loss, constraints)
                     lagrangian.backward()
                 else:
                     loss.backward()
@@ -513,12 +629,17 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # --- model selection: CE, plus constraint violation when constrained ---
+            # --- per-epoch: full-train violation drives BOTH the dual update
+            #     and the best-epoch selection score ---
             model.eval()
             with torch.no_grad():
                 score = criterion(model(X_t), y_t).item()
-                if dual is not None and self._constraints_fn_ is not None:
-                    score += sel_weight * self._constraints_fn_(model, X_t).mean().item()
+                if constrained:
+                    c_full = self._constraints_fn_(model, X_t)   # full-train
+                    # Step the duals on (violation - slack) so they can decrease
+                    # when the violation is within estimation noise.
+                    dual.update(c_full - alm_slack)
+                    score += sel_weight * c_full.mean().item()
             if score < best_score:
                 best_score = score
                 best_state = copy.deepcopy(model.state_dict())

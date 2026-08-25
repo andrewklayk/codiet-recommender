@@ -18,10 +18,15 @@ Design (chain  A -> B -> C, target = C, features = {A, B}):
 
 We compare, on a held-out IN-DISTRIBUTION set and on the SHIFTED set:
 
-    uncon_all   vanilla,     features {A, B}            (free to (ab)use A)
-    con_all     constrained, features {A, B}            (penalised for A-C dep.)
-    dsep_uncon  vanilla,     Markov blanket {B} only    (A dropped -> invariant)
-    dsep_con    constrained, Markov blanket {B} only
+    uncon_all   vanilla,                      features {A, B}  (free to (ab)use A)
+    con_all     constrained,                  features {A, B}  (penalised for A-C dep.)
+    uncon_ME    vanilla + Moreau-env. optim,  features {A, B}  (optimizer-only control)
+    dsep_uncon  vanilla,                      Markov blanket {B} only (A dropped -> invariant)
+    dsep_con    constrained,                  Markov blanket {B} only
+
+uncon_ME isolates how much of con_all's behaviour (if any) comes from the
+Moreau-envelope-wrapped optimizer alone, as opposed to the ALM causal
+constraint itself: same features as uncon_all/con_all, no constraints.
 
 Expectation: in-distribution all are similar; under shift dsep_* stay low while
 uncon_all degrades most, with con_all in between if the constraint is doing its
@@ -31,6 +36,8 @@ majority-class baseline (1.0 = no better than predicting that set's majority).
 Usage:
     python test_shift.py
     python test_shift.py --n-seeds 30 --n-train 150 --networks mlp,deep_mlp
+    # all five backbones used by test_all_networks.py / test_constraints.py:
+    #   mlp, deep_mlp, onehot_mlp, embedding_mlp, transformer (now the default)
 """
 import argparse
 import logging
@@ -51,12 +58,13 @@ W = np.zeros((3, 3))
 W[0, 1] = 1   # A -> B
 W[1, 2] = 1   # B -> C  (target C; Markov blanket of C is {B})
 
-# (label, use_alm, restrict_to_markov_blanket)
+# (label, use_alm, restrict_to_markov_blanket, use_moreau)
 METHODS = [
-    ("uncon_all",  False, False),
-    ("con_all",    True,  False),
-    ("dsep_uncon", False, True),
-    ("dsep_con",   True,  True),
+    ("uncon_all",  False, False, False),
+    ("con_all",    True,  False, False),
+    ("uncon_ME",   False, False, True),
+    ("dsep_uncon", False, True,  False),
+    ("dsep_con",   True,  True,  False),
 ]
 METHOD_ORDER = [m[0] for m in METHODS]
 
@@ -116,7 +124,8 @@ def main():
     p.add_argument("--n-values", type=int, default=3)
     p.add_argument("--dominant-prob", type=float, default=0.8)
     p.add_argument("--n-epochs", type=int, default=50)
-    p.add_argument("--networks", default="mlp,deep_mlp")
+    p.add_argument("--networks",
+                   default="mlp,deep_mlp,onehot_mlp,embedding_mlp,transformer")
     args = p.parse_args()
 
     net_labels = [s.strip() for s in args.networks.split(",")]
@@ -129,9 +138,10 @@ def main():
         train, indist, shift = make_datasets(
             seed, args.n_train, args.n_eval, args.n_values, args.dominant_prob)
         for net in net_labels:
-            for method, use_alm, mb in METHODS:
+            for method, use_alm, mb, use_moreau in METHODS:
                 cfg = {"network": net, "n_epochs": args.n_epochs,
-                       "use_alm": use_alm, "restrict_to_markov_blanket": mb}
+                       "use_alm": use_alm, "restrict_to_markov_blanket": mb,
+                       "use_moreau": use_moreau}
                 torch.manual_seed(seed)
                 m = DiscreteRecommenderPredictor(W, "C", NODES, "none", None, cfg)
                 m.fit(train[["A", "B"]], train["C"])

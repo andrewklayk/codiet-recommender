@@ -21,7 +21,9 @@ learning_rate: 0.001
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 use_alm: true
-alm_lr: 0.1
+alm_lr: 5.0          # duals stepped once per epoch on the full-train violation
+alm_penalty: 1.0     # ALM quadratic-penalty coefficient
+alm_slack: 0.01      # step duals on (violation - slack) so they can decrease
 alm_momentum: 0.5
 
 # debugging
