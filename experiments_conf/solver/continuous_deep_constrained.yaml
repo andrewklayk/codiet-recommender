@@ -1,0 +1,36 @@
+name: continuous_deep_constrained
+model_name: CONT
+custom_objective: none
+n_runs: 5
+recalculate_dag: false
+
+# neural network architecture
+# backbone: mlp | deep_mlp | transformer
+network: deep_mlp
+hidden_dim: 128
+n_layers: 4
+dropout: 0.1
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# interaction-graph baselines: restrict the model's input features.
+restrict_to_parents: false
+restrict_to_markov_blanket: false
+
+# continuous constraints-function knobs (see ContinuousTripletConstraintsFn)
+cond_basis: linear
+ridge: 0.0001
+conditioner: linear
+
+# constrained training via humancompatible/train (pip install humancompatible-train)
+use_alm: true
+alm_lr: 5.0
+alm_penalty: 1.0
+alm_slack: 0.01
+alm_momentum: 0.5
+
+# debugging
+debug: false

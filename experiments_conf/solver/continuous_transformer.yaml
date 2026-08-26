@@ -1,0 +1,36 @@
+name: continuous_transformer
+model_name: CONT
+custom_objective: none
+n_runs: 5
+recalculate_dag: false
+
+# neural network architecture
+# backbone: mlp | deep_mlp | transformer
+network: transformer
+d_model: 32
+n_heads: 4
+n_layers: 2
+dim_feedforward: 64
+dropout: 0.1
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# interaction-graph baselines: restrict the model's input features.
+restrict_to_parents: false
+restrict_to_markov_blanket: false
+
+# continuous constraints-function knobs (see ContinuousTripletConstraintsFn)
+cond_basis: linear
+ridge: 0.0001
+conditioner: linear
+
+use_alm: false
+n_constraints: 1
+alm_lr: 0.1
+alm_momentum: 0.5
+
+# debugging
+debug: false

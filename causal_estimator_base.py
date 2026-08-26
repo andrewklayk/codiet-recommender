@@ -122,7 +122,6 @@ class CausalConstrainedPredictor(BaseEstimator):
         self._rf_model_ = None
         self._constraints_fn_ = None
         self._w_est = w_est
-        self._classes = None
         self._feature_mask = None
         self._kept_features = None
 
@@ -130,16 +129,23 @@ class CausalConstrainedPredictor(BaseEstimator):
     # feature restriction (interaction-graph baseline)
     # ------------------------------------------------------------------
 
-    def _select_features(self, X_arr):
-        """Apply the fitted column mask; fall back to a constant column.
+    def _select_features(self, X_arr, fitting=False):
+        """Apply the fitted column mask, then the subclass's own feature
+        preparation hook; fall back to a constant column when the mask is empty.
 
         When the target has no retained features (e.g. a root node under
         restrict_to_parents) the mask is empty and we feed a single constant
         feature so the network simply learns the class prior.
+
+        fitting is forwarded to _prepare_features (True only when called from
+        fit(), so e.g. a StandardScaler fits its stats once on the training
+        set and only transforms afterward).
         """
         if self._feature_mask:
-            return X_arr[:, self._feature_mask]
-        return np.zeros((X_arr.shape[0], 1), dtype=X_arr.dtype)
+            X_masked = X_arr[:, self._feature_mask]
+        else:
+            X_masked = np.zeros((X_arr.shape[0], 1), dtype=X_arr.dtype)
+        return self._prepare_features(X_masked, fitting)
 
     # ------------------------------------------------------------------
     # subclass hooks
@@ -159,6 +165,19 @@ class CausalConstrainedPredictor(BaseEstimator):
         self._classes) as a side effect here.
         """
         raise NotImplementedError
+
+    def _prepare_features(self, X_sel, fitting):
+        """Optional hook: transform the already feature-restricted array
+        before it becomes a training/eval tensor (e.g. StandardScaler for a
+        continuous estimator). Called from _select_features, so it runs
+        identically in fit(), constraint_violation(), and predict().
+
+        fitting=True only when called from fit() (fit_transform semantics);
+        False everywhere else (transform only, reusing stats fit during
+        training). Default: identity -- a classifier over raw category
+        indices (the discrete estimator) needs no scaling.
+        """
+        return X_sel
 
     def _build_model(self, n_features, n_outputs, X_sel):
         """Instantiate the backbone network (an nn.Module).
@@ -271,7 +290,7 @@ class CausalConstrainedPredictor(BaseEstimator):
         y_t, n_outputs = self._prepare_target(y)
 
         # --- tensors & dataloader (features restricted to self._feature_mask) ---
-        X_sel = self._select_features(np.asarray(X))
+        X_sel = self._select_features(np.asarray(X), fitting=True)
         X_t = torch.tensor(X_sel, dtype=torch.float32)
         loader = DataLoader(TensorDataset(X_t, y_t),
                             batch_size=batch_size, shuffle=True)

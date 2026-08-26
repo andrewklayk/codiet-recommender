@@ -10,6 +10,7 @@ import torch
 from compute_tools import compute_predictor_errors
 from recommender_estimator import XGBRecommenderPredictor, REGRecommenderPredictor, HCRecommenderPredictor, compute_predictor_errors_and_cs_scikit, compute_predictor_errors_scikit
 from discrete_estimator import DiscreteRecommenderPredictor, compute_discrete_predictor_errors_scikit
+from continuous_estimator import ContinuousRecommenderPredictor
 
 
 def get_mean_average_errors(prep_data, run_feats, target_col, w_est, row_and_col_names,
@@ -117,8 +118,11 @@ def create_model(model_name, w_est, target_col, row_and_col_names, custom_object
     elif model_name == "DISC":
         model = DiscreteRecommenderPredictor(w_est, target_col, row_and_col_names, custom_objective,
                                              prep_data, solver_cfg)
+    elif model_name == "CONT":
+        model = ContinuousRecommenderPredictor(w_est, target_col, row_and_col_names, custom_objective,
+                                               prep_data, solver_cfg)
     if model is None:
-        raise ValueError("Model can be only XGB, REG, HC, or DISC.")
+        raise ValueError("Model can be only XGB, REG, HC, DISC, or CONT.")
     return model
 
 

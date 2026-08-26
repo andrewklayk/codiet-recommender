@@ -304,6 +304,13 @@ class DiscreteRecommenderPredictor(CausalConstrainedPredictor):
                      emb_dim, d_model, ...) from cfg.
     """
 
+    def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
+                 prep_data, cfg, constraints_fn=None):
+        super().__init__(w_est, target_col, row_and_col_names, custom_objective,
+                         prep_data, cfg, constraints_fn)
+        # class order predict() indexes into; set for real by _prepare_target.
+        self._classes = None
+
     # ------------------------------------------------------------------
     # discrete-specific helper
     # ------------------------------------------------------------------

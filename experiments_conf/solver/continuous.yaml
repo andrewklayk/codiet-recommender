@@ -1,0 +1,43 @@
+name: continuous
+model_name: CONT
+custom_objective: none
+n_runs: 5
+recalculate_dag: false
+
+# neural network architecture
+# backbone: mlp | deep_mlp | transformer
+network: mlp
+hidden_dim: 64
+n_layers: 2
+# extra knobs used by some backbones:
+# dropout: 0.1        # deep_mlp / transformer
+# d_model: 32         # transformer
+# n_heads: 4          # transformer
+# dim_feedforward: 64 # transformer
+
+# training
+n_epochs: 50
+batch_size: 32
+learning_rate: 0.001
+
+# interaction-graph baselines: restrict the model's input features.
+#   restrict_to_parents:        keep only the target's direct causes (parents)
+#   restrict_to_markov_blanket: keep parents + children + co-parents
+# markov_blanket takes precedence if both are true. Combines with use_alm.
+restrict_to_parents: false
+restrict_to_markov_blanket: false
+
+# continuous constraints-function knobs (see ContinuousTripletConstraintsFn)
+cond_basis: linear     # 'linear' or 'poly:k'
+ridge: 0.0001          # ridge penalty for the Frisch-Waugh-Lovell solve
+conditioner: linear    # only 'linear' is implemented; 'rank'/'kernel' raise
+
+# constrained training via humancompatible/train (pip install humancompatible-train)
+# set use_alm: true and wire up constraints_fn in code to activate
+use_alm: false
+n_constraints: 1
+alm_lr: 0.1
+alm_momentum: 0.5
+
+# debugging
+debug: false
