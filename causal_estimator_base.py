@@ -1,0 +1,475 @@
+"""Estimator-independent ALM / Moreau-envelope constrained training loop.
+
+CausalConstrainedPredictor factors out everything about fitting a causally
+constrained neural predictor that does NOT depend on the concrete backbone,
+loss, or target encoding: hyper-parameter resolution, the parent / Markov-
+blanket feature-restriction baseline, the DataLoader, auto-building and
+calibrating the constraints function, choosing the optimiser (plain Adam /
+Moreau-envelope-only / ALM), the training loop itself, and constraint_violation
+reporting. Subclasses (discrete_estimator.DiscreteRecommenderPredictor now, a
+planned continuous estimator later) plug in a handful of hooks -- target
+encoding, model/criterion/constraints-fn construction, and predict() -- and
+get all of the above for free.
+
+Builds on causal_triplets.py for the graph-only triplet logic (this module
+adds the estimator/data side: fitting a model against those triplets).
+"""
+import copy
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.base import BaseEstimator
+
+from causal_triplets import (TripletType, get_target_triplets, parent_features,
+                             markov_blanket_features, filter_triplets)
+
+
+class CausalConstrainedPredictor(BaseEstimator):
+    """Base class for scikit-learn compatible, causally constrained predictors.
+
+    Accepts the same constructor signature as the other RecommenderPredictor
+    classes so subclasses plug into the existing create_model /
+    run_feature_selection_scikit pipeline without modification to those call
+    sites.
+
+    The DAG adjacency matrix (w_est) is stored as _w_est and passed through
+    unchanged; DAG recalculation is not performed here.
+
+    Training is driven by whatever criterion _build_criterion() returns. When
+    cfg.use_alm=True and constraints_fn is provided (or auto-built via
+    _build_constraints_fn), the loop uses ALM from
+    humancompatible.train.dual_optim (pip install humancompatible-train).
+
+    Args:
+        constraints_fn (callable | None): called as
+            constraints_fn(model, X_batch, y_batch) -> 1-D Tensor of constraint
+            violations.  Required when cfg.use_alm=True.  This is the hook for
+            plugging in humancompatible/train-style constrained training.
+
+    NN hyper-parameters (read from cfg, all optional):
+        n_epochs     (int,   default 50)   training epochs
+        batch_size   (int,   default 32)   mini-batch size
+        learning_rate(float, default 1e-3) Adam learning rate
+
+    Feature-restriction baseline (read from cfg):
+        restrict_to_parents (bool, default False) when True, the model is fed
+            only the direct causes (parents) of the target in the interaction
+            graph w_est; all other columns are dropped.
+        restrict_to_markov_blanket (bool, default False) when True, the model is
+            fed only the target's Markov blanket (parents + children +
+            co-parents) -- the variables with predictive power under
+            d-separation. Takes precedence over restrict_to_parents if both set.
+        Either restriction combines with use_alm: constraints are then limited to
+            triplets whose variables all survive. Orthogonal to use_alm, so all
+            (vanilla / constrained) x (all / parents / markov_blanket)
+            combinations are available.
+
+    ALM hyper-parameters (read from cfg, used only when use_alm=True):
+        use_alm      (bool,  default False)
+        n_constraints(int,   default 1)    number of constraints returned by constraints_fn
+        alm_lr       (float, default 5.0)  dual variable learning rate. The duals
+            are updated ONCE PER EPOCH on the full training set (not per
+            minibatch), so with honestly-measured violations the classic small
+            step is far too weak; 5.0 matches the Markov-blanket oracle here.
+        alm_penalty  (float, default 1.0)  ALM quadratic-penalty coefficient
+            (the `penalty` arg of humancompatible ALM).
+        alm_slack    (float, default 0.01) tolerance subtracted from the
+            full-train violation before the dual update, i.e. duals step on
+            (violation - alm_slack). This lets duals DECREASE when violations are
+            within estimation noise, breaking the monotone ratchet that arises
+            because constraints are nonnegative by construction.
+        alm_momentum (float, default 0.5)  dual variable momentum
+        collider_margin_fraction (float, default 0.5) forwarded to the
+            constraints function's calibrate_collider_margins, when it has one
+            (see the _build_constraints_fn hook docstring).
+        alm_selection_weight (float, default 1.0) weight on the mean constraint
+            violation when picking the best epoch under constrained training;
+            the selection score is _selection_loss(...) + alm_selection_weight *
+            mean_violation, with the violation measured on the full training set
+            (the same evaluation used for the dual update). Plain training uses
+            _selection_loss(...) alone.
+
+    Moreau-envelope-only hyper-parameters (read from cfg, used only when
+    use_moreau=True; ignored if use_alm=True, which already wraps Adam in
+    MoreauEnvelope alongside the ALM duals):
+        use_moreau   (bool,  default False) wrap Adam in
+            humancompatible.train.dual_optim.MoreauEnvelope with no dual
+            variables or constraints -- isolates the effect of the optimizer
+            alone from the effect of the causal constraint (the "uncon_ME"
+            ablation in test_all_networks.py / test_constraints.py /
+            test_shift.py).
+        moreau_mu    (float, default 2.0)  smoothing multiplier
+        moreau_beta  (float, default 0.5)  smoothing multiplier update rate
+
+    Dual-update scheme: per minibatch we backprop the Lagrangian via
+    dual.forward(loss, constraints) WITHOUT stepping the duals; once per epoch we
+    evaluate the constraints on the whole training set and call
+    dual.update(violation - alm_slack). This decouples the (noisy, per-batch)
+    primal gradient from the (stable, per-epoch) dual dynamics.
+    """
+
+    def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
+                 prep_data, cfg, constraints_fn=None):
+        self.w_est = w_est
+        self.target_col = target_col
+        self.row_and_col_names = row_and_col_names
+        self.custom_objective = custom_objective
+        self.prep_data = prep_data
+        self.cfg = cfg
+        self.constraints_fn = constraints_fn
+        self._rf_model_ = None
+        self._constraints_fn_ = None
+        self._w_est = w_est
+        self._classes = None
+        self._feature_mask = None
+        self._kept_features = None
+
+    # ------------------------------------------------------------------
+    # feature restriction (interaction-graph baseline)
+    # ------------------------------------------------------------------
+
+    def _select_features(self, X_arr):
+        """Apply the fitted column mask; fall back to a constant column.
+
+        When the target has no retained features (e.g. a root node under
+        restrict_to_parents) the mask is empty and we feed a single constant
+        feature so the network simply learns the class prior.
+        """
+        if self._feature_mask:
+            return X_arr[:, self._feature_mask]
+        return np.zeros((X_arr.shape[0], 1), dtype=X_arr.dtype)
+
+    # ------------------------------------------------------------------
+    # subclass hooks
+    # ------------------------------------------------------------------
+    # A concrete predictor implements these; CausalConstrainedPredictor never
+    # imports a concrete backbone, loss, or constraints-function class, so
+    # this module stays independent of any one estimator (discrete now,
+    # continuous later).
+
+    def _prepare_target(self, y):
+        """Encode the raw target `y` into a training tensor.
+
+        Returns (y_tensor, n_outputs): y_tensor is fed to the DataLoader
+        alongside X_t; n_outputs is the model's output width (n_classes for a
+        classifier, 1 for scalar regression, ...). Subclasses may stash
+        whatever bookkeeping predict() needs (e.g. the discrete estimator's
+        self._classes) as a side effect here.
+        """
+        raise NotImplementedError
+
+    def _build_model(self, n_features, n_outputs, X_sel):
+        """Instantiate the backbone network (an nn.Module).
+
+        X_sel is the already feature-restricted training array, passed
+        through in case a subclass needs to inspect the data itself (e.g. the
+        discrete estimator's category cardinality).
+        """
+        raise NotImplementedError
+
+    def _build_criterion(self):
+        """Return the (stateless) loss callable: criterion(logits, y_t) -> scalar tensor."""
+        raise NotImplementedError
+
+    def _build_constraints_fn(self, triplets, kept_features, X_sel, y_t):
+        """Build the constraints-function object used for ALM training.
+
+        Called only when cfg.use_alm=True and no constraints_fn was supplied
+        to the constructor; `triplets` is already filtered to the kept
+        features. Must return an object usable as
+        constraints_fn(model, X_batch, y_batch) -> 1-D Tensor of violations,
+        and MAY additionally implement calibrate_collider_margins(X, y,
+        fraction). fit() probes for that method via a hasattr guard (never
+        isinstance), so this base module never needs to import a concrete
+        constraints-function class.
+        """
+        raise NotImplementedError
+
+    def _eval_constraints_fn(self, triplets, feature_names, X_sel):
+        """Build the constraints-function object used for POST-HOC reporting
+        in constraint_violation().
+
+        Should reuse whatever calibration the fitted self._constraints_fn_
+        carries (e.g. calibrated collider margins) when available, so training
+        and reporting score the exact same constraint rather than silently
+        re-deriving an uncalibrated one. Must return an object with
+        violations_with_terms(model, X_batch) -> list[(violation, n_terms)].
+        """
+        raise NotImplementedError
+
+    def _selection_loss(self, model, X_t, y_t):
+        """Full-train score used to pick the best epoch (lower is better).
+
+        Default: the plain criterion value, matching plain (unconstrained)
+        training's selection rule. Constrained training adds
+        alm_selection_weight * mean_violation on top of this in fit() itself.
+        """
+        criterion = self._build_criterion()
+        return criterion(model(X_t), y_t).item()
+
+    def predict(self, X):
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # training
+    # ------------------------------------------------------------------
+
+    def fit(self, X, y=None):
+        # --- resolve hyper-parameters from cfg ---
+        # (network architecture knobs like hidden_dim/n_layers are read by the
+        #  subclass's own _build_model, e.g. discrete_networks.build_network)
+        n_epochs      = self.cfg.get('n_epochs',      50)
+        batch_size    = self.cfg.get('batch_size',    32)
+        lr            = self.cfg.get('learning_rate', 1e-3)
+        use_alm       = self.cfg.get('use_alm',       False)
+        alm_lr        = self.cfg.get('alm_lr',        5.0)
+        alm_penalty   = self.cfg.get('alm_penalty',   1.0)
+        alm_slack     = self.cfg.get('alm_slack',     0.01)
+        alm_momentum  = self.cfg.get('alm_momentum',  0.5)
+        # Moreau-envelope smoothing on its own (no ALM dual/constraints): isolates
+        # the effect of the optimizer alone from the effect of the causal
+        # constraints, for the uncon_ME ablation.
+        use_moreau    = self.cfg.get('use_moreau',    False)
+        moreau_mu     = self.cfg.get('moreau_mu',     2.0)
+        moreau_beta   = self.cfg.get('moreau_beta',   0.5)
+
+        # --- resolve the feature-restriction mode (interaction-graph baseline) ---
+        # 'markov_blanket' keeps parents + children + co-parents; 'parents' keeps
+        # only the direct causes; 'none' keeps everything. Markov blanket takes
+        # precedence if both flags are set.
+        if self.cfg.get('restrict_to_markov_blanket', False):
+            restrict_mode = 'markov_blanket'
+        elif self.cfg.get('restrict_to_parents', False):
+            restrict_mode = 'parents'
+        else:
+            restrict_mode = 'none'
+
+        # --- feature restriction ---
+        feature_names = (list(X.columns) if hasattr(X, 'columns')
+                         else [n for n in self.row_and_col_names
+                               if n != self.target_col])
+        if restrict_mode == 'markov_blanket':
+            kept = markov_blanket_features(self.w_est, self.row_and_col_names,
+                                           self.target_col, feature_names)
+        elif restrict_mode == 'parents':
+            kept = parent_features(self.w_est, self.row_and_col_names,
+                                   self.target_col, feature_names)
+        else:
+            kept = list(feature_names)
+
+        if restrict_mode != 'none':
+            kept_set = set(kept)
+            self._feature_mask = [i for i, f in enumerate(feature_names)
+                                  if f in kept_set]
+        else:
+            self._feature_mask = list(range(len(feature_names)))
+        self._kept_features = kept
+
+        # --- target encoding (hook) ---
+        y_t, n_outputs = self._prepare_target(y)
+
+        # --- tensors & dataloader (features restricted to self._feature_mask) ---
+        X_sel = self._select_features(np.asarray(X))
+        X_t = torch.tensor(X_sel, dtype=torch.float32)
+        loader = DataLoader(TensorDataset(X_t, y_t),
+                            batch_size=batch_size, shuffle=True)
+
+        n_features = X_t.shape[1]
+
+        # --- resolve the constraints function (never mutate the ctor param) ---
+        # When ALM is on and the user passed none, auto-build one via the
+        # subclass's _build_constraints_fn. The result lives in the fitted
+        # attribute self._constraints_fn_, leaving the constructor argument
+        # self.constraints_fn untouched, so sklearn clone()/get_params and any
+        # re-fit keep re-deriving from the original input.
+        constraints_fn = self.constraints_fn
+        if use_alm and constraints_fn is None:
+            triplets = get_target_triplets(self.w_est, self.row_and_col_names,
+                                           self.target_col)
+            if restrict_mode != 'none':
+                # A constraint over an excluded variable is meaningless for a
+                # model that never sees it: keep only triplets whose variables
+                # all remain (the target plus the retained features).
+                allowed = set(kept) | {self.target_col}
+                triplets = filter_triplets(triplets, allowed)
+            constraints_fn = self._build_constraints_fn(triplets, kept, X_sel, y_t)
+        self._constraints_fn_ = constraints_fn
+
+        # Calibrate collider hinge margins from the achievable dependence in the
+        # TRUE training labels, so the constraint never asks for more conditional
+        # dependence than the data actually contains (else the dual diverges).
+        # hasattr, not isinstance: this base module never imports a concrete
+        # constraints-function class, so it duck-types the optional method.
+        if use_alm and hasattr(self._constraints_fn_, 'calibrate_collider_margins'):
+            margin_fraction = self.cfg.get('collider_margin_fraction', 0.5)
+            self._constraints_fn_.calibrate_collider_margins(
+                X_sel, y_t, margin_fraction)
+
+        # Determine the dual dimension AFTER the constraints function exists, so
+        # every constraint it returns gets its own dual variable in the ALM.
+        n_constraints = getattr(constraints_fn, 'n_constraints',
+                                self.cfg.get('n_constraints', 1))
+
+        # --- build network (hook) ---
+        model = self._build_model(n_features, n_outputs, X_sel)
+        criterion = self._build_criterion()
+
+        # --- optimiser (plain, Moreau-only, or ALM-wrapped) ---
+        if use_alm:
+            # humancompatible/train integration:
+            # pip install humancompatible-train
+            from humancompatible.train.dual_optim import ALM, MoreauEnvelope
+            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr))
+            dual = ALM(m=n_constraints, lr=alm_lr, momentum=alm_momentum,
+                       penalty=alm_penalty)
+        elif use_moreau:
+            # Same optimizer wrapper as ALM training, but with no dual variables
+            # or constraints: measures what the Moreau-envelope smoothing alone
+            # contributes, decoupled from the causal-constraint penalty.
+            from humancompatible.train.dual_optim import MoreauEnvelope
+            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr),
+                                       mu=moreau_mu, beta=moreau_beta)
+            dual = None
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            dual = None
+
+        # --- training loop ---
+        # We keep the *best* model seen during training rather than the last
+        # one: after each epoch the model's full-train selection score is
+        # evaluated (no_grad) and the parameters with the lowest score are
+        # cached. _selection_loss is used as the selection criterion for both
+        # the plain and the constrained variants because it is the underlying
+        # prediction objective and is comparable across epochs (unlike the
+        # Lagrangian, whose value shifts as the dual variables update).
+        # Constrained training selects on _selection_loss + sel_weight * mean
+        # violation so the returned epoch is not the one that fits the data
+        # hardest while breaking the causal facts. A fixed sel_weight (rather
+        # than the shifting dual variables) keeps the score comparable across
+        # epochs; plain training falls back to _selection_loss alone.
+        sel_weight = self.cfg.get('alm_selection_weight', 1.0)
+        constrained = dual is not None and self._constraints_fn_ is not None
+        best_score = float('inf')
+        best_state = copy.deepcopy(model.state_dict())
+        for _ in range(n_epochs):
+            model.train()
+            for X_batch, y_batch in loader:
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+
+                if constrained:
+                    # Backprop the Lagrangian with the duals held FIXED for the
+                    # epoch (forward, not forward_update): the per-minibatch
+                    # constraint estimate is noisy and, being nonnegative, would
+                    # ratchet the duals upward every step.
+                    constraints = self._constraints_fn_(model, X_batch, y_batch)
+                    lagrangian = dual.forward(loss, constraints)
+                    lagrangian.backward()
+                else:
+                    loss.backward()
+
+                optimizer.step()
+                optimizer.zero_grad()
+
+            # --- per-epoch: full-train violation drives BOTH the dual update
+            #     and the best-epoch selection score ---
+            model.eval()
+            with torch.no_grad():
+                score = self._selection_loss(model, X_t, y_t)
+                if constrained:
+                    c_full = self._constraints_fn_(model, X_t)   # full-train
+                    # Step the duals on (violation - slack) so they can decrease
+                    # when the violation is within estimation noise.
+                    dual.update(c_full - alm_slack)
+                    score += sel_weight * c_full.mean().item()
+            if score < best_score:
+                best_score = score
+                best_state = copy.deepcopy(model.state_dict())
+
+        model.load_state_dict(best_state)
+        model.eval()
+        self._rf_model_ = model
+        self._w_est = self.w_est
+        return self
+
+    # ------------------------------------------------------------------
+    # reporting
+    # ------------------------------------------------------------------
+
+    def constraint_violation(self, X, aggregate='mean'):
+        """How much the fitted model's predictions violate the causal constraints.
+
+        Reuses the very same triplet enumeration (get_target_triplets) as
+        constrained training, but substitutes the model's PREDICTED target for
+        the true label, so the result measures whether the trained predictor
+        respects the conditional-independence constraints implied by w_est.
+        Works for any fitted model regardless of cfg.use_alm, enabling a
+        constrained-vs-unconstrained comparison.
+
+        The constraints-function object used to score this is built by the
+        _eval_constraints_fn hook, which is expected to reuse whatever
+        calibration (e.g. collider margins) the fitted self._constraints_fn_
+        carries -- so this reports the exact constraint training saw rather
+        than silently re-deriving a fresh, uncalibrated one.
+
+        X : the same feature frame/array passed to fit/predict (the estimator
+            applies its own feature mask internally for prediction; constraint
+            expectations use the feature columns present in X).
+        aggregate : 'mean' (default) or 'sum', applied to 'total' and to each
+            entry of 'by_type'.
+
+        Returns dict:
+            total      : float, `aggregate` over ALL triplets combined
+                        (pd.NA when no triplet involves the target).
+            by_type    : {'chain': float|pd.NA, 'fork': float|pd.NA,
+                         'collider': float|pd.NA} -- same `aggregate`, computed
+                         separately per causal structure so one structure's
+                         violations can't hide in an overall mean; pd.NA for a
+                         structure with no triplets here (e.g. after feature
+                         restriction).
+            per_triplet: list[float], one violation per triplet in `triplets`
+                        order (get_target_triplets(), filtered to the model's
+                        kept features).
+            n_terms    : list[int], parallel to per_triplet -- the number of
+                        valid (non-empty) conditioning cells that violation was
+                        averaged over. n_terms == 0 means every conditioning
+                        cell was empty for this X, so that triplet's near-zero
+                        violation reflects missing data, not a satisfied
+                        constraint.
+            n_triplets : int, len(per_triplet).
+        """
+        if self._rf_model_ is None:
+            raise RuntimeError("call fit() before constraint_violation()")
+        # Evaluate over exactly the features the model was trained on (the same
+        # construction as fit): triplets whose variables all survive, feature
+        # names = the kept columns, X selected through the fitted mask.
+        feature_names = list(self._kept_features or [])
+        allowed = set(feature_names) | {self.target_col}
+        triplets = filter_triplets(
+            get_target_triplets(self.w_est, self.row_and_col_names, self.target_col),
+            allowed)
+        empty_by_type = {tt.value: pd.NA for tt in TripletType}
+        if not triplets:
+            return {'total': np.nan, 'by_type': empty_by_type,
+                    'per_triplet': [], 'n_terms': [], 'n_triplets': 0}
+        X_sel = self._select_features(np.asarray(X))
+
+        cfn = self._eval_constraints_fn(triplets, feature_names, X_sel)
+
+        with torch.no_grad():
+            pairs = cfn.violations_with_terms(
+                self._rf_model_, torch.tensor(X_sel, dtype=torch.float32))
+        per_triplet = [float(v.item()) for v, _n in pairs]
+        n_terms = [int(n) for _v, n in pairs]
+
+        agg = np.mean if aggregate == 'mean' else np.sum
+        total = float(agg(per_triplet))
+        by_type = {}
+        for tt in TripletType:
+            vals = [v for v, t in zip(per_triplet, triplets) if t.type == tt]
+            by_type[tt.value] = float(agg(vals)) if vals else pd.NA
+
+        return {'total': total, 'by_type': by_type, 'per_triplet': per_triplet,
+                'n_terms': n_terms, 'n_triplets': len(triplets)}

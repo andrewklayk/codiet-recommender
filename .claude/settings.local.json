@@ -12,7 +12,11 @@
       "Bash(ls -la \"C:/Users/petrr/Documents/codiet/recommender/results/20260722-fixesfable/\")",
       "Bash(C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe -c ' *)",
       "Bash(cd \"C:/Users/petrr/Documents/venvs_python/exmag/Lib/site-packages/humancompatible/train\" 2>/dev/null && ls && sed -n '1,160p' dual_optim.py)",
-      "Bash(PYTHONPATH=\"C:/Users/petrr/Documents/codiet/recommender/codiet_recommender2\" \"C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe\" \"C:/Users/petrr/AppData/Local/Temp/claude/C--Users-petrr-Documents-codiet-recommender-codiet-recommender2/0bc1fb28-5d70-4c8b-892c-1d74f92e2955/scratchpad/probe.py\")"
+      "Bash(PYTHONPATH=\"C:/Users/petrr/Documents/codiet/recommender/codiet_recommender2\" \"C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe\" \"C:/Users/petrr/AppData/Local/Temp/claude/C--Users-petrr-Documents-codiet-recommender-codiet-recommender2/0bc1fb28-5d70-4c8b-892c-1d74f92e2955/scratchpad/probe.py\")",
+      "Bash(\"C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe\" -m pytest tests -q)",
+      "Bash(\"C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe\" -m unittest discover -s tests -t . -v)",
+      "Bash(C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe test_shift.py --n-seeds 2 --n-epochs 10 --networks mlp,transformer --out C:/Users/petrr/AppData/Local/Temp/claude/C--Users-petrr-Documents-codiet-recommender-codiet-recommender2/3688161c-bea6-4d46-8b83-2a0219c9c850/scratchpad/new)",
+      "Bash(C:/Users/petrr/Documents/venvs_python/exmag/Scripts/python.exe test_constraints.py --n-seeds 1 --n-epochs 3 --n-runs 2 --networks mlp --out C:/Users/petrr/AppData/Local/Temp/claude/C--Users-petrr-Documents-codiet-recommender-codiet-recommender2/3688161c-bea6-4d46-8b83-2a0219c9c850/scratchpad/cnew)"
     ]
   }
 }
