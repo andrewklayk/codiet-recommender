@@ -98,9 +98,12 @@ class TestConstraintExpectations(unittest.TestCase):
             {"network": "mlp", "n_epochs": 3, "use_alm": True})
         m.fit(data[["A", "B"]], data["C"])
         v = m.constraint_violation(data[["A", "B"]])
-        self.assertEqual(set(v), {"total", "per_triplet", "n_triplets"})
+        self.assertEqual(set(v),
+                         {"total", "by_type", "per_triplet", "n_terms", "n_triplets"})
         self.assertIsInstance(v["total"], float)
         self.assertGreaterEqual(v["total"], 0.0)
+        self.assertEqual(len(v["n_terms"]), len(v["per_triplet"]))
+        self.assertEqual(set(v["by_type"]), {"chain", "fork", "collider"})
         self.assertEqual(m.predict(data[["A", "B"]]).shape, (120,))
 
 

@@ -65,6 +65,7 @@ import pandas as pd
 import networkx as nx
 from openpyxl.styles import Font
 
+from causal_triplets import markov_blanket_features
 from er_graph import _generate_cpt, _topological_order, _sample_categorical
 from test_all_networks import (NETWORKS, load_solver, evaluate, bold_min_cells,
                                fit_violation)
@@ -127,21 +128,6 @@ def build_structure_dataset(edges, n_samples, n_values, dominant_prob, seed):
     return pd.DataFrame(X, columns=NODES), B
 
 
-def markov_blanket(B, target):
-    """Markov-blanket variable names of `target`: parents, children, co-parents.
-
-    These are exactly the vertices that carry predictive information about the
-    target under d-separation (everything else is d-separated from the target
-    given this set).
-    """
-    t = NODES.index(target)
-    parents = {i for i in range(len(NODES)) if B[i, t]}
-    children = {j for j in range(len(NODES)) if B[t, j]}
-    coparents = {i for c in children for i in range(len(NODES)) if B[i, c]}
-    mb = (parents | children | coparents) - {t}
-    return [NODES[i] for i in sorted(mb)]
-
-
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -196,7 +182,7 @@ def main():
             row_and_col_names = list(data.columns)
             for target in NODES:
                 all_feats = [c for c in NODES if c != target]
-                mb_feats = markov_blanket(B, target)
+                mb_feats = markov_blanket_features(B, NODES, target, all_feats)
                 for label in net_labels:
                     for method, variant, restrict, fs in METHODS:
                         cfg = solvers[(label, variant)]

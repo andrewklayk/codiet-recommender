@@ -1,42 +1,22 @@
 import copy
-from dataclasses import dataclass
-from enum import Enum
 
-import networkx as nx
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.base import BaseEstimator
 from sklearn.metrics import accuracy_score
 
+from causal_triplets import (TripletType, Triplet, get_target_triplets,
+                             parent_features, markov_blanket_features,
+                             filter_triplets)
 from discrete_networks import build_network
 
 
 def compute_discrete_predictor_errors_scikit(estimator, X, y):
     """Scoring for discrete estimator: returns classification error (1 - accuracy)."""
     return 1.0 - accuracy_score(y, estimator.predict(X))
-
-
-class TripletType(Enum):
-    """Causal structure of a triplet centred on `centre`.
-
-    CHAIN    — left → centre → right
-    FORK     — left ← centre → right   (common cause)
-    COLLIDER — left → centre ← right   (common effect / v-structure)
-    """
-    CHAIN = 'chain'
-    FORK = 'fork'
-    COLLIDER = 'collider'
-
-
-@dataclass(frozen=True)
-class Triplet:
-    """A causal triplet over three named variables, centred on `centre`."""
-    type: TripletType
-    left: str
-    centre: str
-    right: str
 
 
 class TripletConstraintsFn:
@@ -49,7 +29,7 @@ class TripletConstraintsFn:
     X_batch the model is called on, in order.
 
     Args:
-        triplets     : output of DiscreteRecommenderPredictor.get_target_triplets()
+        triplets     : output of causal_triplets.get_target_triplets()
         feature_names: ordered column names of X_batch passed to __call__
         target_col   : name of the target variable (supplied by the model)
         n_values     : category cardinality (drives the conditioning loops)
@@ -143,7 +123,8 @@ class TripletConstraintsFn:
         return self._expect(v1 * v2, given, X, soft_probs)
 
     def _constraint_for_triplet(self, triplet, X, soft_probs, soft_val):
-        """Scalar violation for one triplet (zero when the constraint holds).
+        """(violation, n_terms) for one triplet (violation is zero when the
+        constraint holds).
 
         Expectations involving the target use the model's predicted class
         distribution (soft_probs / soft_val); feature expectations use the data.
@@ -154,6 +135,12 @@ class TripletConstraintsFn:
         inject a fake "(0 - E[...])^2" violation or push its gradient onto the
         samples in the other, populated cells. The average is taken over the
         number of VALID terms (>= 1 to avoid division by zero).
+
+        n_terms is the number of those valid terms -- 0 means every
+        conditioning cell was empty on this batch, so the returned violation is
+        a meaningless zero rather than evidence the constraint holds. For
+        COLLIDER triplets n_terms counts only the hinge (inequality) cells, not
+        the (always data-only-or-skipped) marginal equality term.
         """
         A, B, C = triplet.left, triplet.centre, triplet.right
         if triplet.type == TripletType.CHAIN:
@@ -171,7 +158,7 @@ class TripletConstraintsFn:
                         continue
                     total = total + (e_c_ab - e_c_b) ** 2
                     n_terms += 1
-            return total / max(1, n_terms)
+            return total / max(1, n_terms), n_terms
 
         if triplet.type == TripletType.FORK:
             # fork A←B→C:  E(A·C|B=b) = E(A|B=b)·E(C|B=b)  for all b
@@ -186,7 +173,7 @@ class TripletConstraintsFn:
                     continue                            # cell B=b empty -> skip
                 total = total + (e_ac_b - e_a_b * e_c_b) ** 2
                 n_terms += 1
-            return total / max(1, n_terms)
+            return total / max(1, n_terms), n_terms
 
         if triplet.type == TripletType.COLLIDER:
             # collider A→B←C:
@@ -226,9 +213,9 @@ class TripletConstraintsFn:
                 n_terms += 1
             hinge = hinge / max(1, n_terms)
 
-            return eq + hinge
+            return eq + hinge, n_terms
 
-        return torch.zeros(1)
+        return torch.zeros(1), 0
 
     def calibrate_collider_margins(self, X_full, y_full, fraction=0.5):
         """Set each collider triplet's hinge margin from the ACHIEVABLE dependence.
@@ -270,6 +257,23 @@ class TripletConstraintsFn:
         self._collider_margins = margins
         return margins
 
+    def violations_with_terms(self, model, X_batch):
+        """[(violation, n_terms), ...] for every triplet, in self.triplets order.
+
+        Same underlying computation as __call__, but also exposes each
+        triplet's n_terms (see _constraint_for_triplet) so callers -- notably
+        DiscreteRecommenderPredictor.constraint_violation -- can tell a
+        genuinely satisfied constraint (n_terms > 0, violation ~ 0) apart from
+        one where every conditioning cell was empty on this data (n_terms == 0).
+        """
+        if not self.triplets:
+            return []
+        soft_probs = torch.softmax(model(X_batch), dim=1)
+        k = torch.arange(soft_probs.shape[1], dtype=soft_probs.dtype)
+        soft_val = (soft_probs * k).sum(dim=1)
+        return [self._constraint_for_triplet(t, X_batch, soft_probs, soft_val)
+                for t in self.triplets]
+
     def __call__(self, model, X_batch, y_batch=None):
         """Per-triplet constraint violations of `model` on the batch.
 
@@ -281,13 +285,7 @@ class TripletConstraintsFn:
         """
         if not self.triplets:
             return torch.zeros(1)
-        soft_probs = torch.softmax(model(X_batch), dim=1)
-        k = torch.arange(soft_probs.shape[1], dtype=soft_probs.dtype)
-        soft_val = (soft_probs * k).sum(dim=1)
-        return torch.cat([
-            self._constraint_for_triplet(t, X_batch, soft_probs, soft_val)
-            for t in self.triplets
-        ])
+        return torch.cat([v for v, _n in self.violations_with_terms(model, X_batch)])
 
 
 class DiscreteRecommenderPredictor(BaseEstimator):
@@ -399,38 +397,6 @@ class DiscreteRecommenderPredictor(BaseEstimator):
     # feature restriction (interaction-graph baseline)
     # ------------------------------------------------------------------
 
-    def _parent_features(self, feature_names):
-        """Subset of `feature_names` that are direct causes (parents) of the target.
-
-        Uses the interaction graph w_est (w_est[i, j] != 0 means i -> j): the
-        parents of the target are exactly the variables with a directed edge
-        into it. Order follows `feature_names`.
-        """
-        names = list(self.row_and_col_names)
-        name_to_idx = {n: i for i, n in enumerate(names)}
-        t = name_to_idx[self.target_col]
-        parents = {names[i] for i in range(len(names)) if self.w_est[i, t] != 0}
-        return [f for f in feature_names if f in parents]
-
-    def _markov_blanket_features(self, feature_names):
-        """Subset of `feature_names` in the target's Markov blanket.
-
-        The Markov blanket is parents + children + co-parents (the other parents
-        of the target's children). Under the interaction graph w_est these are
-        exactly the variables that carry predictive information about the target:
-        everything outside the blanket is d-separated from the target given it.
-        Order follows `feature_names`.
-        """
-        names = list(self.row_and_col_names)
-        name_to_idx = {n: i for i, n in enumerate(names)}
-        t = name_to_idx[self.target_col]
-        W = self.w_est
-        parents = {i for i in range(len(names)) if W[i, t] != 0}
-        children = {j for j in range(len(names)) if W[t, j] != 0}
-        coparents = {i for c in children for i in range(len(names)) if W[i, c] != 0}
-        mb = {names[i] for i in (parents | children | coparents) - {t}}
-        return [f for f in feature_names if f in mb]
-
     def _select_features(self, X_arr):
         """Apply the fitted column mask; fall back to a constant column.
 
@@ -498,9 +464,11 @@ class DiscreteRecommenderPredictor(BaseEstimator):
                          else [n for n in self.row_and_col_names
                                if n != self.target_col])
         if restrict_mode == 'markov_blanket':
-            kept = self._markov_blanket_features(feature_names)
+            kept = markov_blanket_features(self.w_est, self.row_and_col_names,
+                                           self.target_col, feature_names)
         elif restrict_mode == 'parents':
-            kept = self._parent_features(feature_names)
+            kept = parent_features(self.w_est, self.row_and_col_names,
+                                   self.target_col, feature_names)
         else:
             kept = list(feature_names)
 
@@ -541,14 +509,14 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         # re-fit keep re-deriving from the original input.
         constraints_fn = self.constraints_fn
         if use_alm and constraints_fn is None:
-            triplets = self.get_target_triplets()
+            triplets = get_target_triplets(self.w_est, self.row_and_col_names,
+                                           self.target_col)
             if restrict_mode != 'none':
                 # A constraint over an excluded variable is meaningless for a
                 # model that never sees it: keep only triplets whose variables
                 # all remain (the target plus the retained features).
                 allowed = set(kept) | {self.target_col}
-                triplets = [tr for tr in triplets
-                            if {tr.left, tr.centre, tr.right} <= allowed]
+                triplets = filter_triplets(triplets, allowed)
             constraints_fn = TripletConstraintsFn(
                 triplets, kept, self.target_col, n_values
             )
@@ -664,20 +632,48 @@ class DiscreteRecommenderPredictor(BaseEstimator):
     def constraint_violation(self, X, aggregate='mean'):
         """How much the fitted model's predictions violate the causal constraints.
 
-        Reuses the very same triplet enumeration (get_target_triplets) and
-        TripletConstraintsFn as constrained training, but substitutes the model's
-        PREDICTED target for the true label, so the result measures whether the
-        trained predictor respects the conditional-independence constraints
-        implied by w_est. Works for any fitted model regardless of cfg.use_alm,
-        enabling a constrained-vs-unconstrained comparison.
+        Reuses the very same triplet enumeration (get_target_triplets) as
+        constrained training, but substitutes the model's PREDICTED target for
+        the true label, so the result measures whether the trained predictor
+        respects the conditional-independence constraints implied by w_est.
+        Works for any fitted model regardless of cfg.use_alm, enabling a
+        constrained-vs-unconstrained comparison.
+
+        If the model was actually trained with ALM, self._constraints_fn_ is
+        the TripletConstraintsFn that training optimised, complete with its
+        calibrated per-triplet collider margins (see
+        TripletConstraintsFn.calibrate_collider_margins). Those SAME margins
+        are reused here, so this reports the exact constraint training saw
+        rather than silently re-deriving a fresh, uncalibrated one (the fixed
+        default collider_margin). Unconstrained models (self._constraints_fn_
+        is None) fall back to that default, since there is nothing calibrated
+        to reuse.
 
         X : the same feature frame/array passed to fit/predict (the estimator
             applies its own feature mask internally for prediction; constraint
             expectations use the feature columns present in X).
-        aggregate : 'mean' (default) or 'sum' over the per-triplet violations.
+        aggregate : 'mean' (default) or 'sum', applied to 'total' and to each
+            entry of 'by_type'.
 
-        Returns dict {'total': float, 'per_triplet': list[float],
-        'n_triplets': int}; total is 0.0 when no triplet involves the target.
+        Returns dict:
+            total      : float, `aggregate` over ALL triplets combined
+                        (pd.NA when no triplet involves the target).
+            by_type    : {'chain': float|pd.NA, 'fork': float|pd.NA,
+                         'collider': float|pd.NA} -- same `aggregate`, computed
+                         separately per causal structure so one structure's
+                         violations can't hide in an overall mean; pd.NA for a
+                         structure with no triplets here (e.g. after feature
+                         restriction).
+            per_triplet: list[float], one violation per triplet in `triplets`
+                        order (get_target_triplets(), filtered to the model's
+                        kept features).
+            n_terms    : list[int], parallel to per_triplet -- the number of
+                        valid (non-empty) conditioning cells that violation was
+                        averaged over. n_terms == 0 means every conditioning
+                        cell was empty for this X, so that triplet's near-zero
+                        violation reflects missing data, not a satisfied
+                        constraint.
+            n_triplets : int, len(per_triplet).
         """
         if self._rf_model_ is None:
             raise RuntimeError("call fit() before constraint_violation()")
@@ -686,85 +682,37 @@ class DiscreteRecommenderPredictor(BaseEstimator):
         # names = the kept columns, X selected through the fitted mask.
         feature_names = list(self._kept_features or [])
         allowed = set(feature_names) | {self.target_col}
-        triplets = [t for t in self.get_target_triplets()
-                    if {t.left, t.centre, t.right} <= allowed]
+        triplets = filter_triplets(
+            get_target_triplets(self.w_est, self.row_and_col_names, self.target_col),
+            allowed)
+        empty_by_type = {tt.value: pd.NA for tt in TripletType}
         if not triplets:
-            return {'total': 0.0, 'per_triplet': [], 'n_triplets': 0}
+            return {'total': np.nan, 'by_type': empty_by_type,
+                    'per_triplet': [], 'n_terms': [], 'n_triplets': 0}
         X_sel = self._select_features(np.asarray(X))
         n_values = self._infer_n_values(X_sel, len(self._classes))
-        cfn = TripletConstraintsFn(triplets, feature_names,
-                                   self.target_col, n_values)
+
+        fitted_cfn = self._constraints_fn_
+        if isinstance(fitted_cfn, TripletConstraintsFn):
+            cfn = TripletConstraintsFn(triplets, feature_names, self.target_col,
+                                       n_values,
+                                       collider_margin=fitted_cfn.collider_margin)
+            cfn._collider_margins = dict(fitted_cfn._collider_margins)
+        else:
+            cfn = TripletConstraintsFn(triplets, feature_names, self.target_col, n_values)
+
         with torch.no_grad():
-            viol = cfn(self._rf_model_,
-                       torch.tensor(X_sel, dtype=torch.float32)).detach().cpu().numpy()
-        total = float(viol.mean() if aggregate == 'mean' else viol.sum())
-        return {'total': total, 'per_triplet': viol.tolist(),
-                'n_triplets': len(triplets)}
+            pairs = cfn.violations_with_terms(
+                self._rf_model_, torch.tensor(X_sel, dtype=torch.float32))
+        per_triplet = [float(v.item()) for v, _n in pairs]
+        n_terms = [int(n) for _v, n in pairs]
 
-    # ------------------------------------------------------------------
-    # causal structure analysis
-    # ------------------------------------------------------------------
+        agg = np.mean if aggregate == 'mean' else np.sum
+        total = float(agg(per_triplet))
+        by_type = {}
+        for tt in TripletType:
+            vals = [v for v, t in zip(per_triplet, triplets) if t.type == tt]
+            by_type[tt.value] = float(agg(vals)) if vals else pd.NA
 
-    def get_target_triplets(self):
-        """Enumerate all chain / fork / collider triplets in w_est that involve target_col.
-
-        w_est convention (confirmed from compute_tools.py / notears_util.py):
-            w_est[i, j] != 0  means  i → j  (row = source, column = target)
-
-        For each unordered triplet {target, i, j} the method tests every node as
-        the potential centre and reports matching directed structures:
-            chain    :  left → centre → right
-            fork     :  left ← centre → right   (common cause)
-            collider :  left → centre ← right   (common effect / v-structure)
-
-        Returns:
-            list[Triplet] — each with .type (a TripletType) and the
-            .left / .centre / .right variable name strings.
-        """
-        names = list(self.row_and_col_names)
-        name_to_idx = {name: idx for idx, name in enumerate(names)}
-        t = name_to_idx[self.target_col]
-        others = [i for i in range(len(names)) if i != t]
-
-        # Directed graph over node indices for d-separation tests.
-        # self.w_est[i, j] != 0 means edge i → j.
-        G = nx.DiGraph()
-        G.add_nodes_from(range(len(names)))
-        G.add_edges_from((i, j) for i in range(len(names))
-                         for j in range(len(names)) if self.w_est[i, j] != 0)
-
-        triplets = []
-        for k in range(len(others)):
-            for l in range(k + 1, len(others)):
-                i, j = others[k], others[l]
-                # rotate through each node as centre; left/right are the remaining two
-                for centre, left, right in [(t, i, j), (i, t, j), (j, t, i)]:
-                    lc = self.w_est[left, centre] != 0   # left  → centre
-                    cl = self.w_est[centre, left] != 0   # centre → left
-                    rc = self.w_est[right, centre] != 0  # right → centre
-                    cr = self.w_est[centre, right] != 0  # centre → right
-
-                    # The numeric (conditional) independence each constraint
-                    # encodes holds only when the conditioning set actually
-                    # d-separates the two endpoints in the *full* DAG — not just
-                    # when the direct left↔right edge is absent.  Indirect active
-                    # paths through other nodes would otherwise invalidate the fact.
-                    #   chain / fork : left ⊥ right | {centre}
-                    #   collider     : left ⊥ right | {}        (marginal)
-                    sep_given_centre = nx.is_d_separator(G, {left}, {right}, {centre})
-                    sep_marginal     = nx.is_d_separator(G, {left}, {right}, set())
-
-                    # chain:    left → centre → right
-                    if lc and cr and sep_given_centre:
-                        triplets.append(Triplet(TripletType.CHAIN, names[left], names[centre], names[right]))
-                    # chain:    right → centre → left
-                    if rc and cl and sep_given_centre:
-                        triplets.append(Triplet(TripletType.CHAIN, names[right], names[centre], names[left]))
-                    # fork:     left ← centre → right
-                    if cl and cr and sep_given_centre:
-                        triplets.append(Triplet(TripletType.FORK, names[left], names[centre], names[right]))
-                    # collider: left → centre ← right
-                    if lc and rc and sep_marginal:
-                        triplets.append(Triplet(TripletType.COLLIDER, names[left], names[centre], names[right]))
-
-        return triplets
+        return {'total': total, 'by_type': by_type, 'per_triplet': per_triplet,
+                'n_terms': n_terms, 'n_triplets': len(triplets)}
