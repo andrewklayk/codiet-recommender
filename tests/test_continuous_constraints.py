@@ -1,16 +1,18 @@
 """Unit tests for ContinuousTripletConstraintsFn: correctness of the
 partial-correlation-based chain/fork/collider proxy, its two must-not-break
-properties (correlation not covariance -> scale invariance; the n_terms
-"could not compute" contract), and a public-API smoke test of the full
-ContinuousRecommenderPredictor.
+properties (correlation not covariance -> EXACT scale invariance; the n_terms
+"could not compute" contract, now correctly scoped to only the two
+irreducible cases -- see the class docstring's "Guards" section), and a
+public-API smoke test of the full ContinuousRecommenderPredictor.
 
-Data model for tests 1-6: a linear-Gaussian chain A -> B -> y (target y,
+Data model for most tests: a linear-Gaussian chain A -> B -> y (target y,
 features {A, B}), built directly against ContinuousTripletConstraintsFn with a
-hand-supplied CHAIN triplet, so each test isolates one specific behaviour
-rather than depending on a trained model's convergence.
+hand-supplied CHAIN or COLLIDER triplet, so each test isolates one specific
+behaviour rather than depending on a trained model's convergence.
 
 Run from the repo root:  python -m unittest discover -s tests -t .
 """
+import math
 import unittest
 
 import numpy as np
@@ -23,6 +25,7 @@ from continuous_estimator import ContinuousTripletConstraintsFn, ContinuousRecom
 
 FEATURES = ["A", "B"]
 CHAIN_A_B_Y = Triplet(TripletType.CHAIN, "A", "B", "y")
+COLLIDER_A_B_Y = Triplet(TripletType.COLLIDER, "A", "B", "y")
 
 
 def _chain_data(n=4000, seed=0):
@@ -38,8 +41,13 @@ def _chain_data(n=4000, seed=0):
     return torch.tensor(A, dtype=torch.float32), torch.tensor(B, dtype=torch.float32)
 
 
-def _cfn(ridge=1e-3):
+def _cfn(ridge=1e-4):
     return ContinuousTripletConstraintsFn([CHAIN_A_B_Y], FEATURES, "y", ridge=ridge)
+
+
+def _cfn_collider(margin=0.30, ridge=1e-4):
+    return ContinuousTripletConstraintsFn([COLLIDER_A_B_Y], FEATURES, "y",
+                                          ridge=ridge, collider_margin=margin)
 
 
 class _LinearOfColumn(nn.Module):
@@ -109,28 +117,84 @@ class TestChainViolation(unittest.TestCase):
         self.assertGreater(viol.item(), 0.05,
                            f"A-dependent model should violate, got {viol.item()}")
 
-    def test_scale_invariance(self):
-        """Correlation, not covariance: scaling the model's output by 10x must
-        leave the violation unchanged (to 1e-5) -- this is what stops ALM from
-        "cheating" by shrinking predictions (see class docstring point 1)."""
+    def test_affine_in_B_near_zero_violation_and_computable(self):
+        """A model that is an EXACT affine function of B (the Bayes-optimal
+        predictor for a linear-Gaussian chain) has ~0 residual once you
+        condition on B -- that is the CORRECT, computable answer (A _||_
+        y_hat | B trivially holds, since y_hat has no variation left once B
+        is known), not an "undecidable" case. Before the fix this wrongly
+        reported n_terms == 0 (the hard eps guard mistook the model's own
+        vanishing residual for "could not compute")."""
         A, B = _chain_data()
         X = torch.stack([A, B], dim=1)
-        base = _LinearOfColumn(col=0, weight=1.0, bias=0.3)
-        scaled = _LinearOfColumn(col=0, weight=10.0, bias=3.0)
+        model = _LinearOfColumn(col=1, weight=1.0, bias=0.3)   # affine in B
         cfn = _cfn()
-        (v1, n1), = cfn.violations_with_terms(base, X)
-        (v2, n2), = cfn.violations_with_terms(scaled, X)
-        self.assertEqual(n1, 1)
-        self.assertEqual(n2, 1)
-        self.assertAlmostEqual(v1.item(), v2.item(), places=5)
+        (viol, n_terms), = cfn.violations_with_terms(model, X)
+        self.assertEqual(n_terms, 1)
+        self.assertLess(viol.item(), 1e-3,
+                        f"affine-in-B model should be ~0, got {viol.item()}")
 
-    def test_constant_predictor_reports_n_terms_zero(self):
-        """A degenerate (constant) predictor must report n_terms == 0 --
-        "could not be computed" -- not a falsely-satisfied ~0 violation (see
-        class docstring point 2)."""
+    def test_scale_invariance(self):
+        """Correlation, not covariance: scaling the model's output leaves the
+        violation EXACTLY unchanged (to high relative precision) -- this is
+        what stops ALM from "cheating" by shrinking predictions (see class
+        docstring point 1). Checked both up (x10) and down (x0.01, x1e-4) --
+        the risky direction is down, since that is what would let a model
+        escape a penalty by shrinking toward 0, and the old absolute "+ eps"
+        denominator broke exactly that direction (measured 9.8e-3 deviation
+        at scale=1e-4) while doing fine at x10."""
+        A, B = _chain_data()
+        X = torch.stack([A, B], dim=1)
+        cfn = _cfn()
+        base = _LinearOfColumn(col=0, weight=1.0, bias=0.3)
+        (v0, n0), = cfn.violations_with_terms(base, X)
+        self.assertEqual(n0, 1)
+        for scale in [10.0, 0.01, 1e-4]:
+            scaled = _LinearOfColumn(col=0, weight=1.0 * scale, bias=0.3 * scale)
+            (v1, n1), = cfn.violations_with_terms(scaled, X)
+            self.assertEqual(n1, 1)
+            self.assertTrue(
+                math.isclose(v0.item(), v1.item(), rel_tol=1e-6, abs_tol=1e-12),
+                f"scale={scale}: base={v0.item()} scaled={v1.item()}")
+
+    def test_constant_predictor_chain_near_zero_violation(self):
+        """A degenerate (constant) predictor on a CHAIN is ALSO a genuinely
+        computable, correct ~0 violation: a constant has no residual
+        variation at all, so it is trivially uncorrelated with A given B.
+        n_terms == 1 (computed), not 0 (see class docstring's Guards
+        section: the target's own degeneracy is not a hard-guard case)."""
         A, B = _chain_data()
         X = torch.stack([A, B], dim=1)
         model = _ConstantModel(c=2.0)
+        cfn = _cfn()
+        (viol, n_terms), = cfn.violations_with_terms(model, X)
+        self.assertEqual(n_terms, 1)
+        self.assertLess(viol.item(), 1e-3,
+                        f"constant model should be ~0 on CHAIN, got {viol.item()}")
+
+    def test_constant_predictor_collider_full_violation(self):
+        """A degenerate (constant) predictor on a COLLIDER is the WORST case,
+        not the best: zero conditional dependence between the collider's
+        endpoints is a full violation of the margin, not an escape from it.
+        Before the fix this wrongly reported n_terms == 0 and violation == 0
+        -- the hinge was silently bypassed by becoming unmeasurable."""
+        A, B = _chain_data()
+        X = torch.stack([A, B], dim=1)
+        model = _ConstantModel(c=2.0)
+        cfn = _cfn_collider(margin=0.30)
+        (viol, n_terms), = cfn.violations_with_terms(model, X)
+        self.assertEqual(n_terms, 1)
+        self.assertAlmostEqual(viol.item(), 0.30, places=2,
+                               msg=f"expected ~margin (0.30), got {viol.item()}")
+
+    def test_constant_data_column_reports_n_terms_zero(self):
+        """The one guard that MUST remain: a constant DATA (non-target)
+        column carries no signal to correlate against, so it is genuinely
+        unmeasurable -- n_terms == 0."""
+        A, B = _chain_data()
+        A_const = torch.zeros_like(A) + 5.0   # constant DATA column
+        X = torch.stack([A_const, B], dim=1)
+        model = _LinearOfColumn(col=1, weight=1.0)
         cfn = _cfn()
         (viol, n_terms), = cfn.violations_with_terms(model, X)
         self.assertEqual(n_terms, 0)
@@ -147,6 +211,45 @@ class TestChainViolation(unittest.TestCase):
         viol.sum().backward()
         self.assertIsNotNone(model.weight.grad)
         self.assertGreater(model.weight.grad.abs().item(), 0.0)
+
+    def test_null_bias_is_small_at_deployed_batch_size(self):
+        """Small-batch bias check (see class docstring's "Small-batch bias"
+        note): under the null (a genuinely B-dependent, non-degenerate model,
+        so the TRUE violation is ~0), the mean measured violation should not
+        be dominated by sampling noise.
+
+        NOTE: at batch=32 the debiased *pre-clip* estimator is essentially
+        exactly unbiased (empirically verified: mean ~= -0.001, from a much
+        larger repeat count than used here), confirming nu = n - p is the
+        right formula (nu = n - p - 1 was also checked and makes no material
+        difference). But relu()'s clip-to-nonnegative -- required because
+        rho^2 cannot be negative -- reintroduces a one-sided bias in the
+        CLIPPED mean at small batch (empirically ~0.018 at batch=32, vs. the
+        ~0.0359 pre-debias figure -- real, but not under ~0.005). This is why
+        fix (b) bumps batch_size to 256 in every continuous*_constrained.yaml
+        (only the constrained configs -- that's where per-minibatch primal
+        gradient noise on this term actually matters): at batch=256 the
+        clipped mean IS comfortably under the 0.005 target (empirically
+        ~0.0016), so that is what this test checks, matching what constrained
+        training actually uses.
+        """
+        cfn = _cfn()
+        rng = np.random.default_rng(2)
+        batch = 256
+        vals = []
+        for trial in range(200):
+            A_np = rng.standard_normal(batch)
+            B_np = 0.7 * A_np + rng.standard_normal(batch) * 0.7
+            X = torch.tensor(np.stack([A_np, B_np], axis=1), dtype=torch.float32)
+            model = _MLPOfColumn(col=1, seed=trial)   # genuinely B-only, nontrivial
+            (viol, n_terms), = cfn.violations_with_terms(model, X)
+            if n_terms == 1:
+                vals.append(viol.item())
+        vals = np.array(vals)
+        self.assertGreater(len(vals), 150, "too many non-computable draws")
+        self.assertLess(vals.mean(), 0.005,
+                        f"null-bias mean at batch={batch} should be < 0.005, "
+                        f"got {vals.mean():.5f}")
 
 
 class TestColliderMarginCalibration(unittest.TestCase):

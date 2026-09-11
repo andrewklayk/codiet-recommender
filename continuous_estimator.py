@@ -33,35 +33,81 @@ class ContinuousTripletConstraintsFn:
     (batch, 1) -- wherever it appears in a triplet, exactly like the discrete
     version's soft_val):
 
-        Phi(b)      = [1, phi(b)]           cond_basis: 'linear' -> phi(b)=[b]
+        Phi(b)       = [1, phi(b)]          cond_basis: 'linear' -> phi(b)=[b]
                                              'poly:k'   -> phi(b)=[b,b^2,...,b^k]
-        residual(v) = v - Phi @ solve(PhiᵀPhi + ridge·I, Phiᵀv)   (FWL; Phi=[1]
-                       alone, i.e. mean-centering, when there is no
-                       conditioning variable -- the marginal/eq case below)
-        pcorr(u,v|b)= <r_u,r_v> / (||r_u||·||r_v|| + eps)
+        residual(v)  = v - Phi @ solve(PhiᵀPhi + ridge·I, Phiᵀv)   (FWL; Phi=[1]
+                        alone, i.e. mean-centering, when there is no
+                        conditioning variable -- the marginal/eq case below)
+        rho(u,v|b)   = <r_u,r_v> / (||r_u||·||r_v|| + delta·||u-mean(u)||·||v-mean(v)|| + 1e-30)
+        rho2(u,v|b)  = relu( (rho(u,v|b)^2 · nu - 1) / (nu - 1) ),  nu = n - p
+                        (p = number of Phi columns: 1 for the marginal/eq
+                        case, 1+dim(phi(b)) when conditioning)
+
+        rho2 is the SQUARED partial correlation, bias-corrected for the
+        upward small-sample bias of sample R^2 under the null (E[rho^2] ≈
+        1/nu when the true correlation is 0 -- see the "small-batch bias"
+        note below); relu clips the rare negative dip from sampling noise.
+        The debias step is affine in rho^2, so differentiability and scale
+        invariance both survive it unchanged.
 
         CHAIN and FORK both encode A _||_ C | centre (a chain and a fork over
         the same three roles license the identical conditional-independence
         fact, just via different DAG structures); on standardized data with a
         (possibly nonlinear, via cond_basis) linear conditioning basis they
         collapse to the SAME test, so both use:
-            g = pcorr(A, C | centre)^2,  n_terms = 1
+            g = rho2(A, C | centre),  n_terms = 1
 
         COLLIDER:
-            eq    = pcorr(A, C | ∅)^2 -- ONLY when the target is an ENDPOINT
+            eq    = rho2(A, C | ∅) -- ONLY when the target is an ENDPOINT
                     (A or C); when the target is the centre, both endpoints
                     are data columns, so this term is a constant fact about
                     the data (zero gradient) and is skipped, exactly as in
                     the discrete version.
-            hinge = max(0, margin_t - |pcorr(A, C | centre)|)
-            g = eq + hinge,  n_terms = 1 if the hinge's pcorr was computable,
-                else 0 (eq does not count toward n_terms, matching the
-                discrete version's rule that n_terms tracks only the hinge /
-                inequality cells, never the marginal equality term).
+            hinge = max(0, margin_t - sqrt(rho2(A, C | centre) + 1e-12))
+                    (the +1e-12 keeps sqrt's gradient finite at rho2 == 0;
+                    calibrate_collider_margins uses this exact same sqrt(rho2
+                    + 1e-12) expression for margin_t, so hinge and margin are
+                    always on the same scale)
+            g = eq + hinge,  n_terms = 1 if rho2(A, C | centre) was
+                computable, else 0 (eq does not count toward n_terms,
+                matching the discrete version's rule that n_terms tracks
+                only the hinge / inequality cells, never the marginal
+                equality term).
 
         When the target IS the centre, Phi is built from y_hat, so the FWL
         projector depends on theta; backprop through torch.linalg.solve is
         well-defined as long as ridge > 0 keeps PhiᵀPhi + ridge·I invertible.
+
+    Guards -- the ONLY two cases where a triplet's violation is reported as
+    UNCOMPUTABLE (n_terms = 0; g = 0, or eq-only for a collider) rather than
+    computed and genuinely near zero:
+        - a needed variable is absent from the batch (e.g. after feature
+          restriction);
+        - a DATA (non-target) variable is constant in this batch, scale-
+          relatively: ||v - mean(v)|| <= 1e-6 · ||v|| -- there is nothing to
+          correlate a constant against. NOT an absolute threshold: an
+          absolute cutoff on a residual NORM changes meaning with batch size
+          (||r|| scales like sqrt(n) even for pure noise) and with the
+          model's output scale, so it is neither a valid "this is degenerate"
+          test nor batch-size invariant.
+    The TARGET's own value collapsing to (near-)constant, or being fully
+    explained by the conditioning variable, is deliberately NOT guarded: rho
+    then goes smoothly (and differentiably) to 0 through the scale-relative
+    denominator above, which is the mathematically CORRECT answer -- a
+    prediction with no residual variation is trivially uncorrelated with
+    anything -- not an unmeasurable one. Getting this backwards previously
+    let a collapsed model dodge the collider hinge entirely (constant output
+    -> "can't compute" -> 0 penalty, when zero conditional dependence between
+    a collider's endpoints is actually the WORST case: hinge should equal the
+    full margin).
+
+    Small-batch bias: the raw (pre-debias) sample rho^2 is upward-biased
+    under the null (true partial correlation 0) by approximately 1/nu at
+    typical minibatch sizes -- e.g. mean rho^2 ≈ 0.036 at batch=32, nu=30, vs.
+    the ALM dual only seeing the true (near-zero) violation once per epoch on
+    the full training set. The debias term above corrects this so the
+    per-minibatch primal gradient is not chasing sampling noise of that
+    magnitude.
 
     Two properties that must NOT be broken by a future edit:
 
@@ -69,27 +115,17 @@ class ContinuousTripletConstraintsFn:
        so under a covariance-based penalty ALM could shrink the violation
        arbitrarily just by shrinking the model's output scale -- and as the
        duals grow this becomes actively PROFITABLE, not just harmless. Under
-       correlation, the gradient in the direction of a uniform rescaling of
-       y_hat is (up to the O(eps) numerical-stability term) exactly zero, so
-       there is no such loophole. Every g above is built from pcorr, never a
-       raw (co)variance.
+       rho, the invariance to a uniform rescaling y_hat -> c*y_hat (c != 0) is
+       EXACT, not approximate: every term of both the numerator and the
+       denominator (||r_u||·||r_v|| AND delta·||u-mean(u)||·||v-mean(v)||)
+       scales by the same factor |c| when y_hat is one of u/v, so it cancels
+       in the ratio exactly. (The old absolute "+ eps" denominator broke this:
+       measured deviation at scale=1e-4 was 9.8e-3, not 0.) rho2's debiasing
+       is affine in rho^2, so it inherits the same exact invariance.
 
     2. The n_terms contract from the discrete version: n_terms == 0 means
-       "could not be computed", NOT "the constraint holds". We return
-       (zeros(1), 0) whenever a needed variable is missing from the batch, OR
-       when either residual is degenerate (||r_u|| < eps or ||r_v|| < eps --
-       e.g. a collapsed/constant predictor). Skipping this guard would let
-       0/eps == 0 masquerade as a satisfied constraint.
-
-       NOTE on eps vs. ridge: ridge regression is BIASED, so even a target
-       that is EXACTLY explained by the conditioning basis (e.g. a literal
-       constant, perfectly captured by the intercept column) gets a nonzero
-       residual of order ridge/sqrt(n) rather than exactly 0 -- purely a
-       ridge artifact, not signal. eps must clear that artifact with margin;
-       the defaults below (ridge=1e-4, eps=1e-3) were picked to keep that
-       artifact under 1e-3 even for small batches (n=50) and large output
-       scales (|y_hat|~20), while staying orders of magnitude below any
-       genuine residual norm (empirically ~1-50 on standardized data).
+       "could not be computed", NOT "the constraint holds" -- see "Guards"
+       above for exactly which two cases that now covers.
 
     conditioner selects how the conditioning set is modelled; only 'linear'
     (ridge-regularized linear residualization, as above) is implemented.
@@ -102,17 +138,22 @@ class ContinuousTripletConstraintsFn:
         target_col   : name of the target variable (supplied by the model)
         cond_basis   : 'linear' or 'poly:k' (k = polynomial degree)
         ridge        : ridge penalty added to PhiᵀPhi before solving (default
-                       1e-4 -- just enough for numerical invertibility; see
-                       the eps note above for why it isn't larger)
+                       1e-4 -- just enough for numerical invertibility)
         collider_margin: fallback hinge margin (overridden per-triplet by
                        calibrate_collider_margins when available)
         conditioner  : 'linear' (default); 'rank'/'kernel' raise NotImplementedError
-        eps          : numerical floor for residual norms / the pcorr
-                       denominator (default 1e-3; see the note above)
+        delta        : scale-relative regularizer for the rho denominator
+                       (default 1e-6) -- about 6 orders of magnitude below a
+                       typical ||r_u||·||r_v||, so it is inert in the normal
+                       case and only takes over as a residual vanishes,
+                       giving rho -> 0 smoothly (with a well-defined
+                       gradient) instead of an unstable/undefined 0/0.
     """
 
+    _CONST_REL_TOL = 1e-6   # scale-relative constancy threshold, see Guards above
+
     def __init__(self, triplets, feature_names, target_col, cond_basis='linear',
-                 ridge=1e-4, collider_margin=0.1, conditioner='linear', eps=1e-3):
+                 ridge=1e-4, collider_margin=0.1, conditioner='linear', delta=1e-6):
         if conditioner != 'linear':
             raise NotImplementedError(
                 f"conditioner={conditioner!r} is not implemented yet -- only "
@@ -126,7 +167,7 @@ class ContinuousTripletConstraintsFn:
         self.ridge = ridge
         self.collider_margin = collider_margin
         self.conditioner = conditioner
-        self.eps = eps
+        self.delta = delta
         # per-triplet hinge margins, keyed by the (frozen) Triplet; set by
         # calibrate_collider_margins(). Empty -> fall back to collider_margin.
         self._collider_margins = {}
@@ -174,14 +215,22 @@ class ContinuousTripletConstraintsFn:
         beta = torch.linalg.solve(PtP + ridge_eye, Phi.T @ v)
         return v - Phi @ beta
 
-    def _pcorr(self, name1, name2, X, y_hat, cond_name=None):
-        """Partial correlation between name1 and name2 given cond_name (None
-        => marginal correlation, via mean-centering only).
+    @staticmethod
+    def _is_effectively_constant(v, rel_tol=_CONST_REL_TOL):
+        """Scale-relative constancy test -- see the class docstring's
+        "Guards" section for why this must be relative, not absolute."""
+        return ((v - v.mean()).norm() <= rel_tol * v.norm()).item()
 
-        Returns None -- "could not be computed", never a phantom zero -- when
-        a named variable is absent from the batch, or when either residual is
-        degenerate (||r|| < eps, e.g. a collapsed/constant predictor); see the
-        class docstring's point 2.
+    def _pcorr2(self, name1, name2, X, y_hat, cond_name=None):
+        """Debiased, squared partial correlation rho2(name1, name2 | cond_name)
+        (None => marginal, i.e. conditioning is just the intercept / mean-
+        centering). See the class docstring's Math and Guards sections.
+
+        Returns None -- "could not be computed", never a phantom zero -- only
+        when a named variable is absent from the batch, or when a DATA (non-
+        target) variable is constant in this batch. The target's own value
+        collapsing is NOT guarded: rho2 goes smoothly (and correctly) to 0
+        through the scale-relative denominator instead.
         """
         u = self._value(name1, X, y_hat)
         v = self._value(name2, X, y_hat)
@@ -192,13 +241,26 @@ class ContinuousTripletConstraintsFn:
             b = self._value(cond_name, X, y_hat)
             if b is None:
                 return None
+
+        if name1 != self.target_col and self._is_effectively_constant(u):
+            return None
+        if name2 != self.target_col and self._is_effectively_constant(v):
+            return None
+        if (cond_name is not None and cond_name != self.target_col
+                and self._is_effectively_constant(b)):
+            return None
+
         r_u = self._residual(u, b)
         r_v = self._residual(v, b)
-        n_u = r_u.norm()
-        n_v = r_v.norm()
-        if n_u < self.eps or n_v < self.eps:
-            return None
-        return (r_u * r_v).sum() / (n_u * n_v + self.eps)
+        u_spread = (u - u.mean()).norm()
+        v_spread = (v - v.mean()).norm()
+        denom = r_u.norm() * r_v.norm() + self.delta * u_spread * v_spread + 1e-30
+        rho2 = ((r_u * r_v).sum() / denom) ** 2
+
+        p = 1 if b is None else 1 + self._phi(b).shape[1]
+        n = u.shape[0]
+        nu = max(n - p, 1)
+        return torch.relu((rho2 * nu - 1) / max(nu - 1, 1))
 
     def _constraint_for_triplet(self, triplet, X, y_hat):
         """(violation, n_terms) for one triplet -- see the class docstring's
@@ -206,23 +268,24 @@ class ContinuousTripletConstraintsFn:
         A, B, C = triplet.left, triplet.centre, triplet.right
 
         if triplet.type in (TripletType.CHAIN, TripletType.FORK):
-            r = self._pcorr(A, C, X, y_hat, cond_name=B)
-            if r is None:
+            g = self._pcorr2(A, C, X, y_hat, cond_name=B)
+            if g is None:
                 return torch.zeros(1), 0
-            return (r ** 2).reshape(1), 1
+            return g.reshape(1), 1
 
         if triplet.type == TripletType.COLLIDER:
             if self.target_col in (A, C):
-                r_marg = self._pcorr(A, C, X, y_hat, cond_name=None)
-                eq = torch.zeros(1) if r_marg is None else (r_marg ** 2).reshape(1)
+                eq2 = self._pcorr2(A, C, X, y_hat, cond_name=None)
+                eq = torch.zeros(1) if eq2 is None else eq2.reshape(1)
             else:
                 eq = torch.zeros(1)
 
             margin = self._collider_margins.get(triplet, self.collider_margin)
-            r_cond = self._pcorr(A, C, X, y_hat, cond_name=B)
-            if r_cond is None:
+            cond2 = self._pcorr2(A, C, X, y_hat, cond_name=B)
+            if cond2 is None:
                 return eq, 0
-            hinge = torch.relu(margin - r_cond.abs()).reshape(1)
+            abs_rho = torch.sqrt(cond2 + 1e-12)
+            hinge = torch.relu(margin - abs_rho).reshape(1)
             return eq + hinge, 1
 
         return torch.zeros(1), 0
@@ -231,7 +294,9 @@ class ContinuousTripletConstraintsFn:
         """Set each collider triplet's hinge margin from the ACHIEVABLE
         dependence, same recipe as the discrete version but from the TRUE
         standardized y instead of one-hot labels:
-        margin_t = fraction * |pcorr(A, C | centre)| on the training data.
+        margin_t = fraction * sqrt(rho2(A, C | centre) + 1e-12) on the
+        training data -- the exact same expression _constraint_for_triplet's
+        hinge uses, so margin and hinge are always on the same scale.
 
         Accepts numpy or torch for y_full (the base class calls this with the
         already-standardized training tensor y_t). Data-only: call once on
@@ -245,8 +310,8 @@ class ContinuousTripletConstraintsFn:
             if t.type != TripletType.COLLIDER:
                 continue
             A, B, C = t.left, t.centre, t.right
-            r = self._pcorr(A, C, X, y, cond_name=B)
-            emp = 0.0 if r is None else float(r.abs().item())
+            cond2 = self._pcorr2(A, C, X, y, cond_name=B)
+            emp = 0.0 if cond2 is None else float(torch.sqrt(cond2 + 1e-12).item())
             margins[t] = max(0.0, fraction * emp)
         self._collider_margins = margins
         return margins
@@ -296,7 +361,7 @@ class ContinuousRecommenderPredictor(CausalConstrainedPredictor):
     only when cfg.use_alm=True and no constraints_fn is supplied):
         cond_basis   (str,   default 'linear') 'linear' or 'poly:k'; see
                      ContinuousTripletConstraintsFn.
-        ridge        (float, default 1e-3) ridge penalty for the FWL solve.
+        ridge        (float, default 1e-4) ridge penalty for the FWL solve.
         conditioner  (str,   default 'linear') only 'linear' is implemented.
 
     _selection_loss is intentionally NOT overridden here (uses the base
@@ -352,7 +417,7 @@ class ContinuousRecommenderPredictor(CausalConstrainedPredictor):
         return ContinuousTripletConstraintsFn(
             triplets, kept_features, self.target_col,
             cond_basis=self.cfg.get('cond_basis', 'linear'),
-            ridge=self.cfg.get('ridge', 1e-3),
+            ridge=self.cfg.get('ridge', 1e-4),
             conditioner=self.cfg.get('conditioner', 'linear'))
 
     def _eval_constraints_fn(self, triplets, feature_names, X_sel):
@@ -373,7 +438,7 @@ class ContinuousRecommenderPredictor(CausalConstrainedPredictor):
             cfn = ContinuousTripletConstraintsFn(
                 triplets, feature_names, self.target_col,
                 cond_basis=self.cfg.get('cond_basis', 'linear'),
-                ridge=self.cfg.get('ridge', 1e-3),
+                ridge=self.cfg.get('ridge', 1e-4),
                 conditioner=self.cfg.get('conditioner', 'linear'))
         return cfn
 
