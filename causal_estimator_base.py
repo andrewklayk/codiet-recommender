@@ -91,9 +91,10 @@ class CausalConstrainedPredictor(BaseEstimator):
             (the same evaluation used for the dual update). Plain training uses
             _selection_loss(...) alone.
 
-    Moreau-envelope-only hyper-parameters (read from cfg, used only when
-    use_moreau=True; ignored if use_alm=True, which already wraps Adam in
-    MoreauEnvelope alongside the ALM duals):
+    Moreau-envelope hyper-parameters (read from cfg; moreau_mu / moreau_beta
+    apply to BOTH the use_moreau=True arm and the use_alm=True arm, which wraps
+    Adam in the same MoreauEnvelope alongside the ALM duals -- keeping the two
+    arms on one optimizer is what makes uncon_ME a valid control for con_*):
         use_moreau   (bool,  default False) wrap Adam in
             humancompatible.train.dual_optim.MoreauEnvelope with no dual
             variables or constraints -- isolates the effect of the optimizer
@@ -339,8 +340,13 @@ class CausalConstrainedPredictor(BaseEstimator):
         if use_alm:
             # humancompatible/train integration:
             # pip install humancompatible-train
+            # The SAME MoreauEnvelope smoothing (same mu/beta, read from cfg) as
+            # the use_moreau branch below -- otherwise uncon_ME would not be a
+            # valid control for this arm: any difference between them would mix
+            # "the causal constraint" with "a differently-tuned optimizer".
             from humancompatible.train.dual_optim import ALM, MoreauEnvelope
-            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr))
+            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr),
+                                       mu=moreau_mu, beta=moreau_beta)
             dual = ALM(m=n_constraints, lr=alm_lr, momentum=alm_momentum,
                        penalty=alm_penalty)
         elif use_moreau:

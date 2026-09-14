@@ -130,14 +130,17 @@ class DeepMLPNetwork(DiscreteNetwork):
 class OneHotMLPNetwork(DiscreteNetwork):
     """One-hot encode every categorical feature, then an MLP.
 
-    cfg knobs: hidden_dim (64), n_layers (2), dropout (0.0).
+    cfg knobs: hidden_dim (64), n_layers (2), dropout (0.1).
+    Defaults MUST equal experiments_conf/solver/discrete_onehot*.yaml, so a
+    caller that builds a cfg by hand (test_shift.py) trains the same network as
+    one that loads the yaml (test_all_networks.py / test_constraints.py).
     """
 
     def __init__(self, n_features, n_classes, n_values, cfg):
         super().__init__(n_features, n_classes, n_values, cfg)
         hidden_dim = cfg.get("hidden_dim", 64)
         n_layers = cfg.get("n_layers", 2)
-        dropout = cfg.get("dropout", 0.0)
+        dropout = cfg.get("dropout", 0.1)
         self.net = _mlp_head(n_features * n_values, hidden_dim, n_layers,
                              n_classes, dropout)
 
@@ -151,7 +154,9 @@ class OneHotMLPNetwork(DiscreteNetwork):
 class EmbeddingMLPNetwork(DiscreteNetwork):
     """A learned embedding per categorical feature, concatenated, then an MLP.
 
-    cfg knobs: emb_dim (8), hidden_dim (64), n_layers (2), dropout (0.0).
+    cfg knobs: emb_dim (8), hidden_dim (64), n_layers (2), dropout (0.1).
+    Defaults MUST equal experiments_conf/solver/discrete_embedding*.yaml (see
+    OneHotMLPNetwork for why).
     """
 
     def __init__(self, n_features, n_classes, n_values, cfg):
@@ -159,7 +164,7 @@ class EmbeddingMLPNetwork(DiscreteNetwork):
         emb_dim = cfg.get("emb_dim", 8)
         hidden_dim = cfg.get("hidden_dim", 64)
         n_layers = cfg.get("n_layers", 2)
-        dropout = cfg.get("dropout", 0.0)
+        dropout = cfg.get("dropout", 0.1)
         self.embeddings = nn.ModuleList(
             [nn.Embedding(n_values, emb_dim) for _ in range(n_features)]
         )

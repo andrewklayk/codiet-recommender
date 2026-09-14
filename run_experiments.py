@@ -73,6 +73,8 @@ def start_experiment(cfg: DictConfig) -> None:
                 graph_type=cfg.problem.get("graph_type", "ER"),
                 n_values=cfg.problem.get("n_values", 3),
                 dominant_prob=cfg.problem.get("dominant_prob", 0.8),
+                cpt_prior=cfg.problem.get("cpt_prior", "dirichlet"),
+                cpt_alpha=cfg.problem.get("cpt_alpha", 0.5),
                 seed=cfg.problem.get("seed"),
                 return_dag=True,
             )

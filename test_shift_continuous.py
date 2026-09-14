@@ -26,14 +26,14 @@ We compare, on a held-out IN-DISTRIBUTION set and on the SHIFTED set:
     uncon_all   vanilla,                      features {A, B}  (free to (ab)use A)
     con_all     constrained,                  features {A, B}  (penalised for A-C dep.)
     uncon_ME    vanilla + Moreau-env. optim,  features {A, B}  (optimizer-only control)
-    dsep_uncon  vanilla,                      Markov blanket {B} only (A dropped -> invariant)
-    dsep_con    constrained,                  Markov blanket {B} only
+    uncon_mb    vanilla,                      Markov blanket {B} only (A dropped -> invariant)
+    con_mb      constrained,                  Markov blanket {B} only
 
 uncon_ME isolates how much of con_all's behaviour (if any) comes from the
 Moreau-envelope-wrapped optimizer alone, as opposed to the ALM causal
 constraint itself: same features as uncon_all/con_all, no constraints.
 
-Expectation: in-distribution all are similar; under shift dsep_* stay low
+Expectation: in-distribution all are similar; under shift *_mb stay low
 while uncon_all degrades most, with con_all in between if the constraint is
 doing its job. Errors are MSE normalised by each eval set's own variance (1.0
 = no better than predicting that set's mean) -- the continuous analogue of
@@ -53,6 +53,7 @@ import torch
 from openpyxl.styles import Font
 
 from continuous_estimator import ContinuousRecommenderPredictor
+from test_all_networks_continuous import NETWORKS, load_solver
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -61,13 +62,19 @@ W = np.zeros((3, 3))
 W[0, 1] = 1   # A -> B
 W[1, 2] = 1   # B -> C  (target C; Markov blanket of C is {B})
 
-# (label, use_alm, restrict_to_markov_blanket, use_moreau)
+# (label, solver-config variant, restrict_to_markov_blanket)
+#   variant: 'uncon' = vanilla Adam, 'con' = ALM-constrained, 'me' = vanilla but
+#            with the Moreau-envelope optimizer (no constraints)
+# Labels follow the scheme shared by every experiment script here,
+# <training regime>_<feature set>.  uncon_parents is omitted on purpose: the
+# target C's parents ({B}) ARE its Markov blanket in this chain, so that method
+# would be bit-identical to uncon_mb.
 METHODS = [
-    ("uncon_all",  False, False, False),
-    ("con_all",    True,  False, False),
-    ("uncon_ME",   False, False, True),
-    ("dsep_uncon", False, True,  False),
-    ("dsep_con",   True,  True,  False),
+    ("uncon_all",  "uncon", False),
+    ("con_all",    "con",   False),
+    ("uncon_ME",   "me",    False),
+    ("uncon_mb",   "uncon", True),
+    ("con_mb",     "con",   True),
 ]
 METHOD_ORDER = [m[0] for m in METHODS]
 
@@ -125,11 +132,28 @@ def main():
     p.add_argument("--n-seeds", type=int, default=20)
     p.add_argument("--n-train", type=int, default=200)
     p.add_argument("--n-eval", type=int, default=1000)
-    p.add_argument("--n-epochs", type=int, default=50)
-    p.add_argument("--networks", default="mlp,deep_mlp,transformer")
+    p.add_argument("--n-epochs", type=int, default=None,
+                   help="override n_epochs in every solver "
+                        "(default: whatever the solver yaml says)")
+    p.add_argument("--networks", default=None,
+                   help="comma-separated subset of backbone labels "
+                        f"(default all: {','.join(n[0] for n in NETWORKS)})")
     args = p.parse_args()
 
-    net_labels = [s.strip() for s in args.networks.split(",")]
+    nets = NETWORKS
+    if args.networks:
+        wanted = {s.strip() for s in args.networks.split(",")}
+        nets = [n for n in NETWORKS if n[0] in wanted]
+        if not nets:
+            raise SystemExit(f"No backbones match {wanted}")
+    net_labels = [n[0] for n in nets]
+    # one solver cfg per (backbone, variant), loaded from experiments_conf --
+    # identical conditions to test_all_networks*.py / test_constraints*.py
+    solvers = {}
+    for label, uncon, con, me in nets:
+        solvers[(label, "uncon")] = load_solver(uncon, args.n_epochs)
+        solvers[(label, "con")] = load_solver(con, args.n_epochs)
+        solvers[(label, "me")] = load_solver(me, args.n_epochs)
     print(f"Backbones: {net_labels} | seeds: {args.n_seeds} | "
           f"n_train={args.n_train} n_eval={args.n_eval} | "
           f"chain A->B->C, target C, P(C|B) fixed, upstream re-rolled\n")
@@ -138,10 +162,12 @@ def main():
     for seed in range(args.n_seeds):
         train, indist, shift = make_datasets(seed, args.n_train, args.n_eval)
         for net in net_labels:
-            for method, use_alm, mb, use_moreau in METHODS:
-                cfg = {"network": net, "n_epochs": args.n_epochs,
-                       "use_alm": use_alm, "restrict_to_markov_blanket": mb,
-                       "use_moreau": use_moreau}
+            for method, variant, mb in METHODS:
+                # the SAME solver yaml the other experiments load, so a
+                # hand-built cfg can never drift from experiments_conf again
+                cfg = solvers[(net, variant)]
+                cfg.restrict_to_parents = False
+                cfg.restrict_to_markov_blanket = mb
                 torch.manual_seed(seed)
                 m = ContinuousRecommenderPredictor(W, "C", NODES, "none", None, cfg)
                 m.fit(train[["A", "B"]], train["C"])

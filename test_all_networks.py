@@ -13,8 +13,8 @@ giving six settings per backbone:
 
     uncon_all   vanilla,     all features
     con_all     constrained, all features
-    uncon_par   vanilla,     parents only        (interaction-graph baseline)
-    con_par     constrained, parents only        (baseline + constraints)
+    uncon_parents vanilla,     parents only      (interaction-graph baseline)
+    con_parents   constrained, parents only      (baseline + constraints)
     uncon_mb    vanilla,     Markov blanket
     con_mb      constrained, Markov blanket
 
@@ -38,10 +38,10 @@ generated er_graph datasets. Results are written to:
 
     <out>.csv   — raw long-form rows (seed, target, network, setting, errors)
     <out>.xlsx  — sheet 'summary_overall' : avg over seeds AND features, one row
-                                            per backbone, the four settings side
+                                            per backbone, the five settings side
                                             by side; best (lowest) per metric bold.
                   sheet 'by_feature_test' : avg test error over seeds, one row per
-                                            target, four settings per backbone;
+                                            target, five settings per backbone;
                                             best per backbone bold.
                   sheet 'by_feature_train': same for train error.
                   sheet 'violation_overall' : avg constraint violation over
@@ -100,8 +100,8 @@ SETTINGS = [
     ("uncon_all", "uncon", "none"),
     ("con_all",   "con",   "none"),
     ("uncon_ME",  "me",    "none"),
-#    ("uncon_par", "uncon", "parents"),
-#    ("con_par",   "con",   "parents"),
+#    ("uncon_parents", "uncon", "parents"),
+#    ("con_parents",   "con",   "parents"),
     ("uncon_mb",  "uncon", "markov_blanket"),
     ("con_mb",    "con",   "markov_blanket"),
 ]
@@ -130,6 +130,8 @@ def build_dataset(problem_cfg, seed):
         graph_type=problem_cfg.get("graph_type", "ER"),
         n_values=problem_cfg.get("n_values", 3),
         dominant_prob=problem_cfg.get("dominant_prob", 0.8),
+        cpt_prior=problem_cfg.get("cpt_prior", "dirichlet"),
+        cpt_alpha=problem_cfg.get("cpt_alpha", 0.5),
         seed=seed,
         return_dag=True,
     )
@@ -210,7 +212,7 @@ def bold_min_cells(ws, df, groups):
 def wide_by_feature(g, net_labels, targets_sorted, metric):
     """Wide per-target table for one metric: <net>_<setting>_<metric> columns.
 
-    Returns (DataFrame, groups) where each group is the four settings of one
+    Returns (DataFrame, groups) where each group is the five settings of one
     backbone (for bold-min highlighting of the best setting per backbone).
     """
     val_col = f"{metric}_error"
@@ -371,7 +373,7 @@ def main():
     print("\n==== Overall test error (avg over seeds & features; lower is better) ====")
     print(overall[[f"{s}_test" for s in SETTING_ORDER]].to_string())
     print(f"\nWrote {csv_path.resolve()}")
-    print(f"Wrote {xlsx_path.resolve()}  (bold = best of the four settings)")
+    print(f"Wrote {xlsx_path.resolve()}  (bold = best of the five settings)")
 
 
 if __name__ == "__main__":

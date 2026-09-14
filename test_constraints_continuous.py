@@ -1,6 +1,6 @@
 """Evaluate the causal constraints in isolation, one structure at a time --
 CONTINUOUS twin of test_constraints.py. Same design (chain / fork / collider,
-same five methods, same five backbones-minus-onehot/embedding), over a
+same six methods, same backbones-minus-onehot/embedding), over a
 linear-Gaussian SEM instead of discrete CPTs, scored by MSE.
 
 Unlike test_all_networks_continuous.py (random ER graphs), this experiment
@@ -11,26 +11,36 @@ uses tiny, hand-built graphs in which *exactly one* causal structure is active:
     collider  A -> B <- C
 
 For each structure we take every node in turn as the prediction target (so for
-the chain the target is first A, then B, then C) and compare five methods,
-each run for all three continuous network backbones:
+the chain the target is first A, then B, then C) and compare six methods, each
+run for all three continuous network backbones. Method labels follow the scheme
+shared by every experiment script here, <training regime>_<feature set>:
 
-    baseline   unconstrained, features = direct PARENTS of the target only
-               (the naive "from A->B->T keep only B" baseline)
-    constr_all constrained (ALM),  features = ALL other variables
-    uncon_ME   unconstrained + Moreau-envelope optimizer, features = ALL other
-               variables (isolates the optimizer's own effect from the causal
-               constraint's effect -- a control for constr_all)
-    dsep_uncon unconstrained,      features = the target's MARKOV BLANKET
-               (the vertices with predictive power according to d-separation:
-                parents + children + co-parents)
-    dsep_con   constrained (ALM),  features = the target's MARKOV BLANKET
+    uncon_parents vanilla Adam,     features = direct PARENTS of the target only
+                  (the naive "from A->B->T keep only B" baseline)
+    uncon_all     vanilla Adam,     features = ALL other variables
+    con_all       constrained (ALM),features = ALL other variables
+    uncon_ME      vanilla + Moreau-envelope optimizer, features = ALL other
+                  variables
+    uncon_mb      vanilla Adam,     features = the target's MARKOV BLANKET
+                  (the vertices with predictive power according to
+                   d-separation: parents + children + co-parents)
+    con_mb        constrained (ALM),features = the target's MARKOV BLANKET
 
-The point: the naive baseline fixes the feature set from the parents alone and
-fails whenever the target has no parents (e.g. the root of a chain) even though
-descendants are predictive; the constrained estimator on the full feature set,
-and the d-separation feature sets, should recover the predictive signal.
-uncon_ME checks that any improvement from constr_all is not simply an artifact
-of training with the Moreau-envelope-wrapped optimizer.
+The point: the naive parents-only baseline fixes the feature set from the
+parents alone and fails whenever the target has no parents (e.g. the root of a
+chain) even though descendants are predictive; the constrained estimator on the
+full feature set, and the d-separation feature sets, should recover the
+predictive signal.
+
+TWO CONTROLS ARE LOAD-BEARING and must not be dropped from METHODS again:
+  * uncon_all is the reference every all-features method has to beat. Without
+    it, uncon_ME and con_all are the only all-features rows and both look
+    strong purely because every other row is feature-restricted -- the measured
+    gap is then "all features vs parents only", not "optimizer" or
+    "constraint".
+  * uncon_ME isolates the optimizer from the constraint: the ALM arm wraps Adam
+    in the same MoreauEnvelope (same mu/beta, see causal_estimator_base.fit),
+    so con_all must be read against uncon_ME, not against uncon_all.
 
 The estimator is NOT modified: the parents-only restriction reuses the existing
 `restrict_to_parents` flag, and the Markov-blanket restriction is applied at the
@@ -89,11 +99,12 @@ STRUCTURES = {
 #            but with the Moreau-envelope optimizer (no constraints)
 #   feature set: 'all' = every other variable, 'mb' = Markov blanket
 METHODS = [
-    ("baseline",   "uncon", True,  "all"),   # parents-only, naive baseline
-    ("constr_all", "con",   False, "all"),   # constraints on all features
-    ("uncon_ME",   "me",    False, "all"),   # optimizer-only control, all features
-    ("dsep_uncon", "uncon", False, "mb"),    # Markov-blanket, no constraints
-    ("dsep_con",   "con",   False, "mb"),    # Markov-blanket, constraints
+    ("uncon_parents", "uncon", True,  "all"),  # vanilla, parents only
+    ("uncon_all",     "uncon", False, "all"),  # vanilla, all features
+    ("con_all",       "con",   False, "all"),  # constrained, all features
+    ("uncon_ME",      "me",    False, "all"),  # Moreau-only control, all features
+    ("uncon_mb",      "uncon", False, "mb"),   # vanilla, Markov blanket
+    ("con_mb",        "con",   False, "mb"),   # constrained, Markov blanket
 ]
 METHOD_ORDER = [m[0] for m in METHODS]
 
@@ -178,6 +189,9 @@ def main():
                     for method, variant, restrict, fs in METHODS:
                         cfg = solvers[(label, variant)]
                         cfg.restrict_to_parents = restrict
+                        # set explicitly, never inherited: the solver cfg
+                        # objects are shared across methods within a backbone
+                        cfg.restrict_to_markov_blanket = False
                         if fs == "mb":
                             # Reduced subproblem over the Markov blanket + target.
                             # The estimator assumes X holds *all* non-target

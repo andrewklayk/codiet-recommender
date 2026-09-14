@@ -8,26 +8,40 @@ hand-built graphs in which *exactly one* causal structure is active:
     collider  A -> B <- C
 
 For each structure we take every node in turn as the prediction target (so for
-the chain the target is first A, then B, then C) and compare four methods, each
-run for all five network backbones:
+the chain the target is first A, then B, then C) and compare six methods, each
+run for all five network backbones. Method labels follow the scheme shared by
+every experiment script here (test_all_networks*.py, test_shift*.py),
+<training regime>_<feature set>:
 
-    baseline   unconstrained, features = direct PARENTS of the target only
-               (the naive "from A->B->T keep only B" baseline)
-    constr_all constrained (ALM),  features = ALL other variables
-    uncon_ME   unconstrained + Moreau-envelope optimizer, features = ALL other
-               variables (isolates the optimizer's own effect from the causal
-               constraint's effect -- a control for constr_all)
-    dsep_uncon unconstrained,      features = the target's MARKOV BLANKET
-               (the vertices with predictive power according to d-separation:
-                parents + children + co-parents)
-    dsep_con   constrained (ALM),  features = the target's MARKOV BLANKET
+    uncon_parents vanilla Adam,     features = direct PARENTS of the target only
+                  (the naive "from A->B->T keep only B" baseline)
+    uncon_all     vanilla Adam,     features = ALL other variables
+    con_all       constrained (ALM),features = ALL other variables
+    uncon_ME      vanilla + Moreau-envelope optimizer, features = ALL other
+                  variables
+    uncon_mb      vanilla Adam,     features = the target's MARKOV BLANKET
+                  (the vertices with predictive power according to
+                   d-separation: parents + children + co-parents)
+    con_mb        constrained (ALM),features = the target's MARKOV BLANKET
 
-The point: the naive baseline fixes the feature set from the parents alone and
-fails whenever the target has no parents (e.g. the root of a chain) even though
-descendants are predictive; the constrained estimator on the full feature set,
-and the d-separation feature sets, should recover the predictive signal.
-uncon_ME checks that any improvement from constr_all is not simply an artifact
-of training with the Moreau-envelope-wrapped optimizer.
+The point: the naive parents-only baseline fixes the feature set from the
+parents alone and fails whenever the target has no parents (e.g. the root of a
+chain) even though descendants are predictive; the constrained estimator on the
+full feature set, and the d-separation feature sets, should recover the
+predictive signal.
+
+TWO CONTROLS ARE LOAD-BEARING and must not be dropped from METHODS again:
+  * uncon_all is the reference every all-features method has to beat. Without
+    it, uncon_ME and con_all are the only all-features rows in the table and
+    both look strong purely because the remaining rows are feature-restricted
+    -- the measured gap is then "all features vs parents only", not "optimizer"
+    or "constraint". (Measured on this very experiment, discrete/mlp, 5 seeds:
+    uncon_parents 0.797, uncon_all 0.760, uncon_ME 0.761, con_all 0.766 -- i.e.
+    once uncon_all is present, uncon_ME's apparent advantage vanishes.)
+  * uncon_ME isolates the optimizer from the constraint: the ALM arm wraps Adam
+    in the same MoreauEnvelope (same mu/beta, see causal_estimator_base.fit),
+    so con_all must be read against uncon_ME, not against uncon_all, to
+    attribute anything to the causal constraint itself.
 
 The estimator is NOT modified: the parents-only restriction reuses the existing
 `restrict_to_parents` flag, and the Markov-blanket restriction is applied at the
@@ -85,17 +99,21 @@ STRUCTURES = {
 #   variant: 'uncon' = vanilla Adam, 'con' = ALM-constrained, 'me' = vanilla
 #            but with the Moreau-envelope optimizer (no constraints)
 #   feature set: 'all' = every other variable, 'mb' = Markov blanket
+# Labels follow the scheme shared by every experiment script (see the module
+# docstring): <training regime>_<feature set>.
 METHODS = [
-    ("baseline",   "uncon", True,  "all"),   # parents-only, naive baseline
-    ("constr_all", "con",   False, "all"),   # constraints on all features
-    ("uncon_ME",   "me",    False, "all"),   # optimizer-only control, all features
-    ("dsep_uncon", "uncon", False, "mb"),    # Markov-blanket, no constraints
-    ("dsep_con",   "con",   False, "mb"),    # Markov-blanket, constraints
+    ("uncon_parents", "uncon", True,  "all"),  # vanilla, parents only
+    ("uncon_all",     "uncon", False, "all"),  # vanilla, all features
+    ("con_all",       "con",   False, "all"),  # constrained, all features
+    ("uncon_ME",      "me",    False, "all"),  # Moreau-only control, all features
+    ("uncon_mb",      "uncon", False, "mb"),   # vanilla, Markov blanket
+    ("con_mb",        "con",   False, "mb"),   # constrained, Markov blanket
 ]
 METHOD_ORDER = [m[0] for m in METHODS]
 
 
-def build_structure_dataset(edges, n_samples, n_values, dominant_prob, seed):
+def build_structure_dataset(edges, n_samples, n_values, dominant_prob, seed,
+                            cpt_prior='dirichlet', cpt_alpha=0.5):
     """Sample a dataset from a fixed DAG (given by `edges`) over NODES.
 
     Reuses er_graph's CPT generation and ancestral sampling so the data-
@@ -111,7 +129,8 @@ def build_structure_dataset(edges, n_samples, n_values, dominant_prob, seed):
         B[idx[src], idx[dst]] = 1
 
     parents = [sorted(np.where(B[:, j] == 1)[0].tolist()) for j in range(d)]
-    cpts = [_generate_cpt(len(pa), n_values, dominant_prob) for pa in parents]
+    cpts = [_generate_cpt(len(pa), n_values, dominant_prob, cpt_prior, cpt_alpha)
+            for pa in parents]
 
     X = np.zeros((n_samples, d), dtype=int)
     for j in _topological_order(B):
@@ -145,8 +164,16 @@ def main():
                         help="samples per dataset (default 1000)")
     parser.add_argument("--n-values", type=int, default=3,
                         help="categories per variable (default 3)")
+    parser.add_argument("--cpt-prior", default="dirichlet",
+                        choices=["dirichlet", "dominant"],
+                        help="how CPT rows are drawn (default dirichlet; see "
+                             "er_graph._generate_cpt)")
+    parser.add_argument("--cpt-alpha", type=float, default=0.5,
+                        help="Dirichlet concentration for --cpt-prior dirichlet "
+                             "(default 0.5)")
     parser.add_argument("--dominant-prob", type=float, default=0.8,
-                        help="CPT dominant-outcome probability (default 0.8)")
+                        help="CPT dominant-outcome probability, only used with "
+                             "--cpt-prior dominant (default 0.8)")
     parser.add_argument("--n-epochs", type=int, default=None,
                         help="override n_epochs in every solver (for quick runs)")
     parser.add_argument("--n-runs", type=int, default=None,
@@ -178,7 +205,8 @@ def main():
     for seed in seeds:
         for struct, edges in STRUCTURES.items():
             data, B = build_structure_dataset(
-                edges, args.n_samples, args.n_values, args.dominant_prob, seed)
+                edges, args.n_samples, args.n_values, args.dominant_prob, seed,
+                args.cpt_prior, args.cpt_alpha)
             row_and_col_names = list(data.columns)
             for target in NODES:
                 all_feats = [c for c in NODES if c != target]
@@ -187,6 +215,9 @@ def main():
                     for method, variant, restrict, fs in METHODS:
                         cfg = solvers[(label, variant)]
                         cfg.restrict_to_parents = restrict
+                        # set explicitly, never inherited: the solver cfg
+                        # objects are shared across methods within a backbone
+                        cfg.restrict_to_markov_blanket = False
                         if fs == "mb":
                             # Reduced subproblem over the Markov blanket + target.
                             # The estimator assumes X holds *all* non-target

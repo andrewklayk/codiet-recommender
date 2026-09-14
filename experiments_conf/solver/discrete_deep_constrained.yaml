@@ -26,5 +26,11 @@ alm_penalty: 1.0     # ALM quadratic-penalty coefficient
 alm_slack: 0.01      # step duals on (violation - slack) so they can decrease
 alm_momentum: 0.5
 
+# Moreau-envelope smoothing: the ALM optimizer wraps Adam in the SAME
+# MoreauEnvelope as the *_me sibling, so uncon_ME is a valid control for this
+# arm. These MUST stay equal to the *_me config's values.
+moreau_mu: 2.0
+moreau_beta: 0.5
+
 # debugging
 debug: false

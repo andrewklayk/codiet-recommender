@@ -21,14 +21,14 @@ We compare, on a held-out IN-DISTRIBUTION set and on the SHIFTED set:
     uncon_all   vanilla,                      features {A, B}  (free to (ab)use A)
     con_all     constrained,                  features {A, B}  (penalised for A-C dep.)
     uncon_ME    vanilla + Moreau-env. optim,  features {A, B}  (optimizer-only control)
-    dsep_uncon  vanilla,                      Markov blanket {B} only (A dropped -> invariant)
-    dsep_con    constrained,                  Markov blanket {B} only
+    uncon_mb    vanilla,                      Markov blanket {B} only (A dropped -> invariant)
+    con_mb      constrained,                  Markov blanket {B} only
 
 uncon_ME isolates how much of con_all's behaviour (if any) comes from the
 Moreau-envelope-wrapped optimizer alone, as opposed to the ALM causal
 constraint itself: same features as uncon_all/con_all, no constraints.
 
-Expectation: in-distribution all are similar; under shift dsep_* stay low while
+Expectation: in-distribution all are similar; under shift *_mb stay low while
 uncon_all degrades most, with con_all in between if the constraint is doing its
 job. Errors are classification error normalised by each eval set's own
 majority-class baseline (1.0 = no better than predicting that set's majority).
@@ -50,6 +50,7 @@ from openpyxl.styles import Font
 
 from er_graph import _generate_cpt, _sample_categorical
 from discrete_estimator import DiscreteRecommenderPredictor
+from test_all_networks import NETWORKS, load_solver
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -58,13 +59,19 @@ W = np.zeros((3, 3))
 W[0, 1] = 1   # A -> B
 W[1, 2] = 1   # B -> C  (target C; Markov blanket of C is {B})
 
-# (label, use_alm, restrict_to_markov_blanket, use_moreau)
+# (label, solver-config variant, restrict_to_markov_blanket)
+#   variant: 'uncon' = vanilla Adam, 'con' = ALM-constrained, 'me' = vanilla but
+#            with the Moreau-envelope optimizer (no constraints)
+# Labels follow the scheme shared by every experiment script here,
+# <training regime>_<feature set>.  uncon_parents is omitted on purpose: the
+# target C's parents ({B}) ARE its Markov blanket in this chain, so that method
+# would be bit-identical to uncon_mb.
 METHODS = [
-    ("uncon_all",  False, False, False),
-    ("con_all",    True,  False, False),
-    ("uncon_ME",   False, False, True),
-    ("dsep_uncon", False, True,  False),
-    ("dsep_con",   True,  True,  False),
+    ("uncon_all",  "uncon", False),
+    ("con_all",    "con",   False),
+    ("uncon_ME",   "me",    False),
+    ("uncon_mb",   "uncon", True),
+    ("con_mb",     "con",   True),
 ]
 METHOD_ORDER = [m[0] for m in METHODS]
 
@@ -77,20 +84,23 @@ def _sample(n, cpt_A, cpt_B, cpt_C, n_values):
     return pd.DataFrame({"A": A, "B": B, "C": C})
 
 
-def make_datasets(seed, n_train, n_eval, n_values, dominant_prob):
+def make_datasets(seed, n_train, n_eval, n_values, dominant_prob,
+                  cpt_prior='dirichlet', cpt_alpha=0.5):
     """Train / in-distribution-test / shifted-test sharing P(C|B).
 
     Upstream CPTs P(A), P(B|A) are re-rolled for the shifted set; P(C|B) is kept.
     """
     np.random.seed(seed)
-    cpt_A = _generate_cpt(0, n_values, dominant_prob)   # P(A)        (1, k)
-    cpt_B = _generate_cpt(1, n_values, dominant_prob)   # P(B|A)      (k, k)
-    cpt_C = _generate_cpt(1, n_values, dominant_prob)   # P(C|B) FIXED (k, k)
+    gen = lambda n_pa: _generate_cpt(n_pa, n_values, dominant_prob,
+                                     cpt_prior, cpt_alpha)
+    cpt_A = gen(0)   # P(A)        (1, k)
+    cpt_B = gen(1)   # P(B|A)      (k, k)
+    cpt_C = gen(1)   # P(C|B) FIXED (k, k)
     train = _sample(n_train, cpt_A, cpt_B, cpt_C, n_values)
     indist = _sample(n_eval, cpt_A, cpt_B, cpt_C, n_values)
     # --- shift: new upstream, same target mechanism ---
-    cpt_A2 = _generate_cpt(0, n_values, dominant_prob)
-    cpt_B2 = _generate_cpt(1, n_values, dominant_prob)
+    cpt_A2 = gen(0)
+    cpt_B2 = gen(1)
     shift = _sample(n_eval, cpt_A2, cpt_B2, cpt_C, n_values)
     return train, indist, shift
 
@@ -122,13 +132,35 @@ def main():
     p.add_argument("--n-train", type=int, default=200)
     p.add_argument("--n-eval", type=int, default=1000)
     p.add_argument("--n-values", type=int, default=3)
-    p.add_argument("--dominant-prob", type=float, default=0.8)
-    p.add_argument("--n-epochs", type=int, default=50)
-    p.add_argument("--networks",
-                   default="mlp,deep_mlp,onehot_mlp,embedding_mlp,transformer")
+    p.add_argument("--cpt-prior", default="dirichlet",
+                   choices=["dirichlet", "dominant"],
+                   help="how CPT rows are drawn (default dirichlet; see "
+                        "er_graph._generate_cpt)")
+    p.add_argument("--cpt-alpha", type=float, default=0.5)
+    p.add_argument("--dominant-prob", type=float, default=0.8,
+                   help="only used with --cpt-prior dominant")
+    p.add_argument("--n-epochs", type=int, default=None,
+                   help="override n_epochs in every solver "
+                        "(default: whatever the solver yaml says)")
+    p.add_argument("--networks", default=None,
+                   help="comma-separated subset of backbone labels "
+                        f"(default all: {','.join(n[0] for n in NETWORKS)})")
     args = p.parse_args()
 
-    net_labels = [s.strip() for s in args.networks.split(",")]
+    nets = NETWORKS
+    if args.networks:
+        wanted = {s.strip() for s in args.networks.split(",")}
+        nets = [n for n in NETWORKS if n[0] in wanted]
+        if not nets:
+            raise SystemExit(f"No backbones match {wanted}")
+    net_labels = [n[0] for n in nets]
+    # one solver cfg per (backbone, variant), loaded from experiments_conf --
+    # identical conditions to test_all_networks*.py / test_constraints*.py
+    solvers = {}
+    for label, uncon, con, me in nets:
+        solvers[(label, "uncon")] = load_solver(uncon, args.n_epochs)
+        solvers[(label, "con")] = load_solver(con, args.n_epochs)
+        solvers[(label, "me")] = load_solver(me, args.n_epochs)
     print(f"Backbones: {net_labels} | seeds: {args.n_seeds} | "
           f"n_train={args.n_train} n_eval={args.n_eval} | "
           f"chain A->B->C, target C, P(C|B) fixed, upstream re-rolled\n")
@@ -136,12 +168,15 @@ def main():
     records = []
     for seed in range(args.n_seeds):
         train, indist, shift = make_datasets(
-            seed, args.n_train, args.n_eval, args.n_values, args.dominant_prob)
+            seed, args.n_train, args.n_eval, args.n_values, args.dominant_prob,
+            args.cpt_prior, args.cpt_alpha)
         for net in net_labels:
-            for method, use_alm, mb, use_moreau in METHODS:
-                cfg = {"network": net, "n_epochs": args.n_epochs,
-                       "use_alm": use_alm, "restrict_to_markov_blanket": mb,
-                       "use_moreau": use_moreau}
+            for method, variant, mb in METHODS:
+                # the SAME solver yaml the other experiments load, so a
+                # hand-built cfg can never drift from experiments_conf again
+                cfg = solvers[(net, variant)]
+                cfg.restrict_to_parents = False
+                cfg.restrict_to_markov_blanket = mb
                 torch.manual_seed(seed)
                 m = DiscreteRecommenderPredictor(W, "C", NODES, "none", None, cfg)
                 m.fit(train[["A", "B"]], train["C"])

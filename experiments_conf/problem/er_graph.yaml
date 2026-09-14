@@ -8,7 +8,13 @@ graph_type: ER # ER, SF, BP, PATH, PATHPERM, G2
 
 # discrete CPT parameters
 n_values: 3        # number of discrete values per variable
-dominant_prob: 0.8 # probability mass on the most likely outcome per parent config
+# How each CPT row is drawn (see er_graph._generate_cpt):
+#   dirichlet — row ~ Dirichlet(cpt_alpha, ...); difficulty varies per node
+#   dominant  — legacy (dominant_prob, q, ..., q); pins EVERY node's Bayes
+#               error at 1 - dominant_prob, so all nodes/graphs look alike
+cpt_prior: dirichlet
+cpt_alpha: 0.5
+dominant_prob: 0.8 # only used when cpt_prior: dominant
 
 # sampling
 n_samples: 1000
