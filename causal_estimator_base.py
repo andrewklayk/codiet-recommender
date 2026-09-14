@@ -345,10 +345,11 @@ class CausalConstrainedPredictor(BaseEstimator):
             # valid control for this arm: any difference between them would mix
             # "the causal constraint" with "a differently-tuned optimizer".
             from humancompatible.train.dual_optim import ALM, MoreauEnvelope
-            optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr),
-                                       mu=moreau_mu, beta=moreau_beta)
+            # optimizer = MoreauEnvelope(torch.optim.Adam(model.parameters(), lr=lr),
+            #                            mu=moreau_mu, beta=moreau_beta)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             dual = ALM(m=n_constraints, lr=alm_lr, momentum=alm_momentum,
-                       penalty=alm_penalty)
+                       penalty=alm_penalty, is_ineq=True)
         elif use_moreau:
             # Same optimizer wrapper as ALM training, but with no dual variables
             # or constraints: measures what the Moreau-envelope smoothing alone
