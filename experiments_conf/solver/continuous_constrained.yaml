@@ -17,7 +17,7 @@ n_layers: 2
 
 # training
 n_epochs: 50
-batch_size: 256
+batch_size: 1024
 learning_rate: 0.001
 
 # interaction-graph baselines: restrict the model's input features.
@@ -34,16 +34,16 @@ conditioner: linear    # only 'linear' is implemented; 'rank'/'kernel' raise
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 use_alm: true
-alm_lr: 5.0
-alm_penalty: 0.0
-alm_slack: 0.01
+alm_lr: 1.0
+alm_penalty: 1.0
+alm_slack: 0.005
 alm_momentum: 0.
 
 # Moreau-envelope smoothing: the ALM optimizer wraps Adam in the SAME
 # MoreauEnvelope as the *_me sibling, so uncon_ME is a valid control for this
 # arm. These MUST stay equal to the *_me config's values.
-moreau_mu: 2.0
-moreau_beta: 0.5
+moreau_mu: 0.0
+moreau_beta: 0.0
 
 # debugging
 debug: false

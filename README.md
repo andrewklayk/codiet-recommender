@@ -1,93 +1,141 @@
 # codiet_recommender
 
+Predictors for CoDiet health-biomarker targets (e.g. CRP, glucose, lipids)
+from food, microbiome, lipidomics and body-composition features, constrained
+by a causal DAG (`w_est`, learned via NOTEARS/MILP) so that the model's
+predictions respect the conditional independencies the DAG implies, not just
+the training loss.
 
+Two branches implement the causal constraint differently:
 
-## Getting started
+- **`main`** — one global linear equation derived algebraically from `w_est`
+  (`nn_lagrangian.py`, `xgboost_lagrangian.py`), enforced as a single
+  Lagrangian penalty term.
+- **`expectations`** (this branch) — every chain/fork/collider **triplet** in
+  the DAG that involves the target becomes its own differentiable
+  conditional-independence violation term, all driven toward zero together by
+  an augmented-Lagrangian dual optimizer (`ALM` from
+  [`humancompatible-train`](https://github.com/andrewklayk/humancompatible-train)).
+  See [`CONSTRAINTS.md`](CONSTRAINTS.md) for the full mechanism (how triplets
+  are enumerated, the violation math, and exactly how ALM is wired into
+  training).
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Core pieces
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+| Piece | File |
+|---|---|
+| Triplet enumeration from the DAG | [`causal_triplets.py`](causal_triplets.py) |
+| Shared ALM/optimizer training loop | [`causal_estimator_base.py`](causal_estimator_base.py) (`CausalConstrainedPredictor.fit`) |
+| Discrete-target estimator + violation math | [`discrete_estimator.py`](discrete_estimator.py) (`DiscreteRecommenderPredictor`, `TripletConstraintsFn`) |
+| Continuous-target estimator + violation math | [`continuous_estimator.py`](continuous_estimator.py) (`ContinuousRecommenderPredictor`, `ContinuousTripletConstraintsFn`) |
+| Pluggable NN backbones | [`discrete_networks.py`](discrete_networks.py), [`continuous_networks.py`](continuous_networks.py) — `mlp`, `deep_mlp`, `onehot_mlp`\*, `embedding_mlp`\*, `transformer` (\*discrete only) |
+| DAG structure learning | [`notears_util.py`](notears_util.py), [`solve_milp.py`](solve_milp.py) |
+| Diet/food-swap recommendation on top of a fitted predictor | [`recommender.py`](recommender.py), [`recommender_nn.py`](recommender_nn.py), [`recommender_estimator.py`](recommender_estimator.py) |
 
-## Add your files
+## Experiments
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+There are two kinds of experiment in this repo: the **real-data pipeline**,
+which fits a recommender to an actual CoDiet/CDS biomarker target, and a
+**synthetic validation suite**, which checks — on data generated from a known
+ground-truth DAG, where "correct" is well-defined — whether the causal
+constraints actually help and isolates *why*.
 
+### Real-data pipeline: `run_experiments.py`
+
+Hydra-driven entry point (`experiments_conf/config.yaml`, defaults to
+`solver: mark`, `problem: codiet`) that loads a CoDiet dataset
+(`data_helper.load_all_data`), fits the configured estimator to predict a
+target biomarker (default `CRP (mg/dL)`, see
+[`experiments_conf/problem/codiet.yaml`](experiments_conf/problem/codiet.yaml))
+from a fixed feature list spanning food composition, body composition,
+serum/urine metabolomics, lipidomics and microbiome features, and logs
+metrics/artifacts to MLflow. Other `problem/*.yaml` files swap in different
+targets (`codiet_glu`, `codiet_hba`, `codiet_ldl`, `codiet_hdl`,
+`codiet_trig`, `codiet_diast`, `codiet_syst`, `codiet_whtr`), different
+datasets (`sachs`, `cds_*`, `FRED_16country_quarterly/industry_eu_*`), or the
+synthetic `er_graph` problem used by the scripts below.
+
+```bash
+python run_experiments.py                              # default: mark solver on codiet/CRP
+python run_experiments.py solver=discrete_constrained problem=codiet_glu
 ```
-cd existing_repo
-git remote add origin https://gitlab.fel.cvut.cz/rytirpav/codiet_recommender.git
-git branch -M main
-git push -uf origin main
-```
 
-## Integrate with your tools
+### Synthetic validation suite
 
-- [ ] [Set up project integrations](https://gitlab.fel.cvut.cz/rytirpav/codiet_recommender/-/settings/integrations)
+All of these generate data from a **known** DAG (so ground-truth conditional
+independencies are exact, not estimated) and compare training regimes across
+every discrete backbone (`mlp`, `deep_mlp`, `onehot_mlp`, `embedding_mlp`,
+`transformer`) or continuous backbone (`mlp`, `deep_mlp`, `transformer`) via
+paired `discrete_*.yaml` / `continuous_*.yaml` solver configs. Each has a
+`*_continuous.py` twin (linear-Gaussian SEM + MSE) alongside the discrete
+version (CPT-sampled DAG + classification error).
 
-## Collaborate with your team
+Settings share one label scheme across all three scripts,
+`<training regime>_<feature set>`:
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+| Setting | Regime | Features |
+|---|---|---|
+| `uncon_all` | vanilla Adam | all other variables |
+| `con_all` | ALM-constrained | all other variables |
+| `uncon_ME` | vanilla + Moreau-envelope-smoothed optimizer, **no** constraints | all other variables |
+| `uncon_parents` | vanilla Adam | target's direct parents only |
+| `uncon_mb` | vanilla Adam | target's Markov blanket (parents + children + co-parents) |
+| `con_mb` | ALM-constrained | target's Markov blanket |
 
-## Test and Deploy
+`uncon_ME` is a *load-bearing control*, not a curiosity: it isolates how much
+of `con_all`'s behaviour comes from the constraint itself versus incidental
+optimizer differences. `uncon_all` is equally load-bearing as the reference
+every all-features method must beat — without it, `uncon_ME`/`con_all` are
+the only all-features rows and look artificially strong next to
+feature-restricted rows for reasons that have nothing to do with the
+constraint.
 
-Use the built-in continuous integration in GitLab.
+- **[`test_all_networks.py`](test_all_networks.py)** /
+  **[`test_all_networks_continuous.py`](test_all_networks_continuous.py)** —
+  the main sweep. Random Erdős–Rényi DAGs (`er_graph.sample_dag` /
+  `continuous_er_graph.sample_dag`), every node taken as target in turn,
+  averaged over `--n-seeds` independently sampled graphs. Reports train/test
+  error and constraint violation per backbone × setting, as long-form CSV and
+  a formatted XLSX (best setting per row bolded).
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+  ```bash
+  python test_all_networks.py --n-seeds 10
+  python test_all_networks_continuous.py --n-seeds 10
+  ```
 
-***
+- **[`test_constraints.py`](test_constraints.py)** /
+  **[`test_constraints_continuous.py`](test_constraints_continuous.py)** —
+  same settings, but on tiny hand-built 3-node graphs where *exactly one*
+  causal structure (chain `A→B→C`, fork `A←B→C`, or collider `A→B←C`) is
+  active at a time, with every node taking a turn as target. Isolates
+  structure-specific failure modes the random-DAG sweep averages away — e.g.
+  a parents-only baseline fails outright when the target is a chain root
+  (no parents) even though its descendants are predictive.
 
-# Editing this README
+- **[`test_shift.py`](test_shift.py)** /
+  **[`test_shift_continuous.py`](test_shift_continuous.py)** — the
+  distribution-shift test, on a fixed chain `A→B→C` with target `C`. The
+  target's own mechanism `P(C|B)` is held fixed between train and test, but
+  the upstream mechanisms `P(A)` and `P(B|A)` are re-rolled for the test set,
+  flipping the in-sample `A`–`C` correlation. In-distribution the constraint
+  is expected to add little (an unconstrained fit on DAG-sampled data already
+  respects the independencies approximately); the constraint is meant to pay
+  off exactly here, where the numbers shift but the graph doesn't — a model
+  that leaned on the now-broken `A`–`C` shortcut should degrade more than one
+  restricted to (or penalized toward) the Markov blanket `{B}`.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+  ```bash
+  python test_shift.py --n-seeds 30 --n-train 150
+  ```
 
-## Suggestions for a good README
+All six scripts accept `--n-epochs`/`--n-runs`/`--targets` overrides for a
+fast smoke test, e.g. `python test_all_networks.py --n-seeds 2 --n-epochs 2
+--n-runs 2 --targets X0,X1`.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## Requirements
 
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Python environment with `torch`, `hydra-core`, `omegaconf`, `mlflow`,
+`scikit-learn`, `xgboost`, `networkx`, `pandas`, `openpyxl`, and
+[`humancompatible-train`](https://github.com/andrewklayk/humancompatible-train)
+(`pip install humancompatible-train`) for the `ALM` dual optimizer used by
+every `*_constrained.yaml` / `use_alm: true` config.

@@ -22,9 +22,19 @@ learning_rate: 0.001
 # constrained training via humancompatible/train (pip install humancompatible-train)
 use_alm: true
 alm_lr: 5.0
-alm_penalty: 0.0
+alm_penalty: 1.0     # >0 auto-selects the ALM package's "hpr" augmentation
+                     # instead of the plain unaugmented Lagrangian -- see
+                     # CONSTRAINTS.md sec. 5 for why: the plain update has no
+                     # fixed point once a constraint's achievable violation
+                     # floor sits above alm_slack, so its dual ratchets to the
+                     # ALM clamp and the penalty term swamps the loss.
 alm_slack: 0.01
 alm_momentum: 0.
+# opt-in: replace the single global alm_slack above with a per-triplet slack
+# calibrated from each triplet's achievable (true-label) violation floor --
+# see CausalConstrainedPredictor.fit's docstring and calibrate_slacks.ipynb.
+calibrate_slacks: true
+slack_calibration_fraction: 1.2
 
 
 # Moreau-envelope smoothing: the ALM optimizer wraps Adam in the SAME
