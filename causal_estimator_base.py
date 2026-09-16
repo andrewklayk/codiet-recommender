@@ -76,14 +76,39 @@ class CausalConstrainedPredictor(BaseEstimator):
         alm_penalty  (float, default 1.0)  ALM quadratic-penalty coefficient
             (the `penalty` arg of humancompatible ALM).
         alm_slack    (float, default 0.01) tolerance subtracted from the
-            full-train violation before the dual update, i.e. duals step on
-            (violation - alm_slack). This lets duals DECREASE when violations are
-            within estimation noise, breaking the monotone ratchet that arises
-            because constraints are nonnegative by construction.
+            violation BOTH in the per-minibatch primal Lagrangian (dual.forward)
+            and in the once-per-epoch dual update, i.e. every constraint value
+            either ever sees is (violation - alm_slack), never the raw
+            violation. This lets duals DECREASE when violations are within
+            estimation noise, breaking the monotone ratchet that arises because
+            constraints are nonnegative by construction -- and, just as
+            importantly, it is what makes alm_slack actually mean "this much
+            violation is tolerated for free": under the "hpr" augmentation
+            (alm_penalty>0) the primal step's weight on d(violation)/d(theta) is
+            max(0, lambda + alm_penalty*c), which for an un-slacked c is > 0 on
+            almost every batch (violations are one-sided) even while lambda == 0
+            -- i.e. without this offset the primal step pulls toward zero
+            violation regardless of alm_slack, and only the mostly-idle dual
+            update would ever see the configured tolerance.
         alm_momentum (float, default 0.5)  dual variable momentum
         collider_margin_fraction (float, default 0.5) forwarded to the
             constraints function's calibrate_collider_margins, when it has one
             (see the _build_constraints_fn hook docstring).
+        calibrate_slacks (bool, default False) opt-in: when True AND the
+            constraints function implements calibrate_slacks (duck-typed via
+            hasattr, like calibrate_collider_margins above), replace the
+            single global alm_slack with a PER-TRIPLET slack derived from
+            each triplet's achievable (true-label) violation floor on the
+            training set -- see TripletConstraintsFn.calibrate_slacks and
+            calibrate_slacks.ipynb, which found some triplets (discrete
+            chains in particular) with a floor well above the global
+            default, leaving their dual with no fixed point. Off by default
+            so existing configs keep behaving exactly as before.
+        slack_calibration_fraction (float, default 1.2) forwarded to
+            calibrate_slacks as `fraction`: each triplet's slack is set to
+            `fraction * floor` (>= 1.0, unlike collider_margin_fraction,
+            since slack should sit above the floor as headroom rather than
+            below it as a minimum ask).
         alm_selection_weight (float, default 1.0) weight on the mean constraint
             violation when picking the best epoch under constrained training;
             the selection score is _selection_loss(...) + alm_selection_weight *
@@ -105,10 +130,39 @@ class CausalConstrainedPredictor(BaseEstimator):
         moreau_beta  (float, default 0.5)  smoothing multiplier update rate
 
     Dual-update scheme: per minibatch we backprop the Lagrangian via
-    dual.forward(loss, constraints) WITHOUT stepping the duals; once per epoch we
-    evaluate the constraints on the whole training set and call
+    dual.forward(loss, constraints - alm_slack) WITHOUT stepping the duals; once
+    per epoch we evaluate the constraints on the whole training set and call
     dual.update(violation - alm_slack). This decouples the (noisy, per-batch)
-    primal gradient from the (stable, per-epoch) dual dynamics.
+    primal gradient from the (stable, per-epoch) dual dynamics, while keeping
+    both estimates of the SAME slack-adjusted quantity -- only the data they're
+    computed over (one minibatch vs. the whole training set) differs.
+
+    Fitted diagnostics attributes (set by fit(), read-only afterwards):
+        train_history_    (list[dict]) one entry per epoch: always
+            {'epoch', 'selection_loss'}; when use_alm=True (constrained)
+            each entry also carries 'violation_mean', 'dual_mean', 'dual_max'
+            and 'n_duals_saturated' -- the full-train mean constraint
+            violation and the ALM dual variables' state right after that
+            epoch's dual.update(). 'n_duals_saturated' counts duals sitting
+            at the optimizer's own clamp (ALM's dual_range upper bound,
+            100.0 by default): a dual pinned there for many consecutive
+            epochs means that constraint's achievable violation floor sits
+            above alm_slack, so the plain/HPR dual update has no fixed point
+            below the clamp -- it will keep climbing for as long as training
+            runs, and the resulting Σλc penalty term can swamp the
+            prediction loss entirely (see CONSTRAINTS.md's worked example).
+        best_epoch_       (int) the epoch (0-indexed) whose state_dict was
+            kept as best_state -- if this equals n_epochs_run_ - 1, training
+            was still improving when it stopped and more epochs might help;
+            if it is much earlier, later epochs were actively getting worse
+            (e.g. a still-climbing dual dragging the model away from a fit
+            it already had).
+        n_epochs_run_     (int) the n_epochs actually used this fit() call
+            (after any cfg override), for comparing against best_epoch_.
+        alm_slack_        (Tensor[n_constraints] | float | None) the actual
+            slack used in this fit() call: per-triplet when calibrate_slacks
+            was on and the constraints function supports it, else the plain
+            cfg.alm_slack scalar broadcast; None when unconstrained.
     """
 
     def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
@@ -327,6 +381,28 @@ class CausalConstrainedPredictor(BaseEstimator):
             self._constraints_fn_.calibrate_collider_margins(
                 X_sel, y_t, margin_fraction)
 
+        # Optionally recalibrate alm_slack itself, per triplet, from each
+        # triplet's achievable (true-label) violation floor -- generalizes the
+        # collider-margin calibration above to the slack tolerance every
+        # constraint is subject to. Run AFTER calibrate_collider_margins so a
+        # collider's floor already reflects its calibrated hinge margin. Off
+        # by default (calibrate_slacks cfg flag); hasattr, not isinstance,
+        # matching the collider-margin probe.
+        if (use_alm and self.cfg.get('calibrate_slacks', False)
+                and hasattr(self._constraints_fn_, 'calibrate_slacks')):
+            slack_fraction = self.cfg.get('slack_calibration_fraction', 1.2)
+            self._constraints_fn_.calibrate_slacks(X_sel, y_t, slack_fraction)
+
+        # Resolve the slack actually used below: per-triplet when calibration
+        # ran and the constraints function exposes it, else the plain global
+        # scalar -- both broadcast the same way against the n_constraints-long
+        # violation vector, so the training loop below doesn't need to care
+        # which one it got.
+        if use_alm and hasattr(self._constraints_fn_, 'slack_vector'):
+            alm_slack_use = self._constraints_fn_.slack_vector(default=alm_slack)
+        else:
+            alm_slack_use = alm_slack
+
         # Determine the dual dimension AFTER the constraints function exists, so
         # every constraint it returns gets its own dual variable in the ALM.
         n_constraints = getattr(constraints_fn, 'n_constraints',
@@ -378,8 +454,16 @@ class CausalConstrainedPredictor(BaseEstimator):
         sel_weight = self.cfg.get('alm_selection_weight', 1.0)
         constrained = dual is not None and self._constraints_fn_ is not None
         best_score = float('inf')
+        best_epoch = -1
         best_state = copy.deepcopy(model.state_dict())
-        for _ in range(n_epochs):
+        # Per-epoch diagnostics (self.train_history_ below): NOT used for
+        # training itself, only for post-hoc inspection -- e.g. whether a
+        # dual variable is still climbing (or pinned at the ALM's own clamp)
+        # when training stops, the signature of a triplet whose achievable
+        # violation floor sits above alm_slack and can never satisfy the
+        # dual update's implicit target of exactly zero. See CONSTRAINTS.md.
+        history = []
+        for epoch in range(n_epochs):
             model.train()
             for X_batch, y_batch in loader:
                 logits = model(X_batch)
@@ -390,7 +474,7 @@ class CausalConstrainedPredictor(BaseEstimator):
                     # epoch (forward, not forward_update): the per-minibatch
                     # constraint estimate is noisy and, being nonnegative, would
                     # ratchet the duals upward every step.
-                    constraints = self._constraints_fn_(model, X_batch, y_batch)
+                    constraints = self._constraints_fn_(model, X_batch, y_batch) - alm_slack_use
                     lagrangian = dual.forward(loss, constraints)
                     lagrangian.backward()
                 else:
@@ -404,20 +488,42 @@ class CausalConstrainedPredictor(BaseEstimator):
             model.eval()
             with torch.no_grad():
                 score = self._selection_loss(model, X_t, y_t)
+                entry = {'epoch': epoch, 'selection_loss': score}
                 if constrained:
                     c_full = self._constraints_fn_(model, X_t)   # full-train
                     # Step the duals on (violation - slack) so they can decrease
                     # when the violation is within estimation noise.
-                    dual.update(c_full - alm_slack)
+                    dual.update(c_full - alm_slack_use)
                     score += sel_weight * c_full.mean().item()
+                    lam = dual.param_groups[0]['params'][0].data
+                    upper = dual.param_groups[0].get('upper_bound')
+                    entry['violation_mean'] = c_full.mean().item()
+                    entry['dual_mean'] = lam.mean().item()
+                    entry['dual_max'] = lam.max().item()
+                    entry['n_duals_saturated'] = (
+                        int((lam >= upper - 1e-9).sum().item())
+                        if upper is not None else 0)
+            history.append(entry)
             if score < best_score:
                 best_score = score
+                best_epoch = epoch
                 best_state = copy.deepcopy(model.state_dict())
 
         model.load_state_dict(best_state)
         model.eval()
         self._rf_model_ = model
         self._w_est = self.w_est
+        # Fitted diagnostics attributes -- populated for every fit() call
+        # (train_history_ entries only carry the dual/violation keys when
+        # constrained is True): best_epoch_ is the epoch fit() actually kept
+        # (== n_epochs_run_ - 1 if training was still improving when it
+        # stopped -- worth checking against n_epochs_run_ before assuming
+        # more epochs wouldn't help); train_history_ is the full per-epoch
+        # trace, so a dual's trajectory can be inspected without re-fitting.
+        self.train_history_ = history
+        self.best_epoch_ = best_epoch
+        self.n_epochs_run_ = n_epochs
+        self.alm_slack_ = alm_slack_use if constrained else None
         return self
 
     # ------------------------------------------------------------------

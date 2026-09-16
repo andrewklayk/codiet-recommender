@@ -53,7 +53,7 @@ import torch
 from openpyxl.styles import Font
 
 from continuous_estimator import ContinuousRecommenderPredictor
-from test_all_networks_continuous import NETWORKS, load_solver
+from test_all_networks_continuous import NETWORKS, load_solver, diagnostics_from_model
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -159,6 +159,7 @@ def main():
           f"chain A->B->C, target C, P(C|B) fixed, upstream re-rolled\n")
 
     records = []
+    history_records = []
     for seed in range(args.n_seeds):
         train, indist, shift = make_datasets(seed, args.n_train, args.n_eval)
         for net in net_labels:
@@ -173,17 +174,38 @@ def main():
                 m.fit(train[["A", "B"]], train["C"])
                 e_in = norm_error(m, indist[["A", "B"]], indist["C"])
                 e_sh = norm_error(m, shift[["A", "B"]], shift["C"])
-                records.append({"seed": seed, "network": net, "method": method,
+                # Train-set diagnostics (constraint violation + breakdown,
+                # best_epoch, ALM dual state) -- see EMPTY_DIAGNOSTICS in
+                # test_all_networks_continuous.py for the field list.
+                diag = diagnostics_from_model(m, train[["A", "B"]])
+                id_cols = {"seed": seed, "network": net, "method": method}
+                history_records.extend(
+                    {**id_cols, **h} for h in getattr(m, "train_history_", []))
+                records.append({**id_cols,
                                 "in_dist": e_in, "shift": e_sh,
-                                "degradation": e_sh - e_in})
+                                "degradation": e_sh - e_in,
+                                **diag})
                 print(f"  seed={seed:2d} {net:9s} {method:10s} "
-                      f"in_dist={e_in:.4f} shift={e_sh:.4f} deg={e_sh-e_in:+.4f}")
+                      f"in_dist={e_in:.4f} shift={e_sh:.4f} deg={e_sh-e_in:+.4f} "
+                      f"best_ep={diag['best_epoch']}/{diag['n_epochs_run']} "
+                      f"dual_max={diag['dual_max']:.2f} sat={diag['n_duals_saturated']}")
 
     raw = pd.DataFrame(records)
     raw.to_csv(Path(f"{args.out}.csv"), index=False)
 
+    # Full per-epoch trace (train set) behind the last-epoch snapshot in
+    # `raw`: one row per (seed, network, method, epoch). Unconstrained
+    # methods' entries only have {'epoch', 'selection_loss'}; pandas fills the
+    # constrained-only columns (dual_mean, ...) with NaN for those rows.
+    history_csv_path = Path(f"{args.out}_history.csv")
+    pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
+
     # summary: mean over seeds, rows = network x method, cols = metrics
-    g = raw.groupby(["network", "method"])[["in_dist", "shift", "degradation"]].mean()
+    # ('violation' included alongside in_dist/shift/degradation so a run's
+    # constraint satisfaction is visible in the same table as its error,
+    # not only in the per-row 'raw' sheet)
+    g = raw.groupby(["network", "method"])[
+        ["in_dist", "shift", "degradation", "violation"]].mean()
     rows = []
     idx = []
     for net in net_labels:
@@ -198,7 +220,7 @@ def main():
     wide.index.name = "method"
     shift_groups = []
     for net in net_labels:
-        for metric in ["in_dist", "shift"]:
+        for metric in ["in_dist", "shift", "violation"]:
             col = f"{net}_{metric}"
             wide[col] = [g.loc[(net, m), metric] for m in METHOD_ORDER]
         shift_groups.append([f"{net}_in_dist"])
@@ -216,6 +238,7 @@ def main():
     print(summary.to_string())
     print(f"\nWrote {Path(f'{args.out}.csv').resolve()}")
     print(f"Wrote {xlsx.resolve()}  (bold = best method per backbone/metric)")
+    print(f"Wrote {history_csv_path.resolve()}  (full per-epoch trace)")
 
 
 if __name__ == "__main__":

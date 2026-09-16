@@ -39,6 +39,10 @@ class TripletConstraintsFn:
         # per-triplet hinge margins, keyed by the (frozen) Triplet; set by
         # calibrate_collider_margins(). Empty -> fall back to collider_margin.
         self._collider_margins = {}
+        # per-triplet ALM slack, keyed by the (frozen) Triplet; set by
+        # calibrate_slacks(). Empty/missing entries fall back to the caller's
+        # default (cfg.alm_slack) via slack_vector().
+        self._slacks = {}
         self._col_idx = {name: i for i, name in enumerate(self.feature_names)}
 
     @property
@@ -250,6 +254,75 @@ class TripletConstraintsFn:
             margins[t] = max(0.0, fraction * emp)
         self._collider_margins = margins
         return margins
+
+    def calibrate_slacks(self, X_full, y_full, fraction=1.2):
+        """Set each triplet's ALM slack from its ACHIEVABLE (true-label) floor.
+
+        Generalizes calibrate_collider_margins's approach from the collider
+        hinge threshold to the alm_slack tolerance itself (the quantity
+        causal_estimator_base.fit() subtracts from every constraint before
+        the ALM sees it). Even a perfectly-fitted model cannot drive a
+        triplet's violation below this floor -- see calibrate_slacks.ipynb,
+        which found discrete CHAIN triplets in particular with floors up to
+        ~13x the global default alm_slack=0.01. Below its own floor, a
+        constraint's dual has no fixed point and ratchets to the ALM's clamp
+        (CONSTRAINTS.md sec. 5).
+
+        The floor is measured by feeding the TRUE label through the exact
+        same _constraint_for_triplet used during training (one-hot,
+        temperature-30 logits standing in for the model's prediction, same
+        trick as calibrate_collider_margins), so this can't silently diverge
+        from what training actually computes. Each triplet's slack is then
+        `fraction` of its floor (fraction >= 1.0, unlike
+        calibrate_collider_margins's fraction <= 1.0 -- here we want slack to
+        sit ABOVE the floor, as headroom, not below it as a minimum ask).
+        Called AFTER calibrate_collider_margins in fit(), so a collider's
+        floor here already reflects its calibrated hinge margin.
+
+        A triplet with n_terms == 0 (every conditioning cell empty on this
+        data) has a meaningless floor of 0; it's left uncalibrated so
+        slack_vector() falls back to the caller's default instead of pinning
+        a real constraint to zero slack.
+
+        Data-only: call once on the full training set. Returns the
+        {triplet: slack} map (also stored on self).
+        """
+        X = torch.as_tensor(np.asarray(X_full), dtype=torch.float32)
+        y = torch.as_tensor(np.asarray(y_full)).long()
+        n = y.shape[0]
+        probs = torch.zeros(n, self.n_values)                 # true label one-hot
+        probs[torch.arange(n), y.clamp(0, self.n_values - 1)] = 1.0
+        val = y.float()                                       # true target values
+        slacks = {}
+        for t in self.triplets:
+            floor, n_terms = self._constraint_for_triplet(t, X, probs, val)
+            if n_terms > 0:
+                slacks[t] = max(0.0, fraction * floor.item())
+        self._slacks = slacks
+        return slacks
+
+    def slack_vector(self, default):
+        """Per-triplet ALM slack Tensor, in self.triplets order.
+
+        The calibrated value from calibrate_slacks() where available, else
+        `default` (the caller's global cfg.alm_slack) for any triplet
+        calibrate_slacks() left uncalibrated (never called, or n_terms == 0
+        on the calibration data) -- mirrors _collider_margins's fallback to
+        self.collider_margin.
+
+        Length matches n_constraints (max(1, len(self.triplets))), NOT
+        len(self.triplets) directly: __call__/violations_with_terms return a
+        single torch.zeros(1) placeholder when there are no triplets (so the
+        ALM still gets its one declared constraint), and a length-0 slack
+        vector here would silently broadcast that (1,) tensor down to (0,) in
+        `constraints - slack_vector(...)`, which the ALM package then rejects
+        as "expected 1 constraint value(s) ... got 0" -- exactly the failure
+        this shape match avoids.
+        """
+        if not self.triplets:
+            return torch.full((1,), float(default), dtype=torch.float32)
+        return torch.tensor([self._slacks.get(t, default) for t in self.triplets],
+                            dtype=torch.float32)
 
     def violations_with_terms(self, model, X_batch):
         """[(violation, n_terms), ...] for every triplet, in self.triplets order.

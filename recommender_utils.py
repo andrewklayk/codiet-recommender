@@ -130,7 +130,8 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
                           target_col,
                           w_est, row_and_col_names,
                           n_runs, n_features,
-                          full_feats, solver_cfg, model_factory=None
+                          full_feats, solver_cfg, model_factory=None,
+                          return_estimators=False
                           ):
     logging.info(f"w_est shape {w_est.shape}")
     logging.info(f"target_col {target_col}")
@@ -196,7 +197,8 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
     results = cross_validate(model, X_selected, y,
         cv=n_runs,
         scoring=(lambda estimator, X, y: compute_predictor_errors_and_cs_scikit(estimator, X, y, estimator._w_est)) if isinstance(model, HCRecommenderPredictor) else _scorer,
-        return_train_score=True
+        return_train_score=True,
+        return_estimator=return_estimators,
     )
 
     if model_name == 'HC':
@@ -213,4 +215,14 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
         results['train_c'] = np.zeros_like(test_mse_fold)
         results['test_c'] = np.zeros_like(test_mse_fold)
 
-    return best_features, train_mse, test_mse, train_mse_fold / score_normalizer, results['train_c'], test_mse_fold / score_normalizer, results["test_c"], w_est
+    ret = (best_features, train_mse, test_mse, train_mse_fold / score_normalizer,
+           results['train_c'], test_mse_fold / score_normalizer, results["test_c"], w_est)
+    if return_estimators:
+        # The actual n_runs fold-fitted estimators, in fold order -- lets a
+        # caller inspect what really produced train_mse/test_mse (e.g. each
+        # fold's own train_history_) instead of only the aggregate scores.
+        # Appended, not inserted, so existing fixed-arity unpacks elsewhere
+        # (run_experiments.py, recommender.py) are unaffected when this stays
+        # False (the default).
+        ret = ret + (results["estimator"],)
+    return ret

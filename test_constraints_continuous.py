@@ -59,6 +59,15 @@ better, 1.0 = predicting the mean):
                                   cols=method; lowest per network bold
                 violation_by_setting: avg violation per structure/target
                 raw             : every individual run
+    <out>_history.csv : full per-epoch trace (seed, structure, target,
+                                  network, method, fold, epoch, selection_loss,
+                                  and -- for use_alm=True methods --
+                                  violation_mean/dual_mean/dual_max/
+                                  n_duals_saturated at that epoch), for EVERY
+                                  one of the n_runs CV-fold models (tagged by
+                                  'fold') -- the same fold models behind
+                                  train_error/test_error and the violation_*
+                                  columns above, not a separate bystander fit
 
 Constraint violation (ContinuousRecommenderPredictor.constraint_violation)
 measures how much a fitted model's predictions break the causal-independence
@@ -81,7 +90,7 @@ from openpyxl.styles import Font
 from causal_triplets import markov_blanket_features
 from notears_util import simulate_parameter, simulate_linear_sem
 from test_all_networks_continuous import (NETWORKS, load_solver, evaluate,
-                                          bold_min_cells, fit_violation)
+                                          bold_min_cells, EMPTY_DIAGNOSTICS)
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -177,6 +186,7 @@ def main():
     print(f"Seeds: {seeds} | {n_runs_eff}-fold CV | methods: {METHOD_ORDER}\n")
 
     records = []
+    history_records = []
     for seed in seeds:
         for struct, edges in STRUCTURES.items():
             data, B = build_structure_dataset(
@@ -211,31 +221,43 @@ def main():
                             # no usable features (e.g. empty Markov blanket):
                             # nothing to learn from -> predict-the-mean baseline
                             tr = te = 1.0
-                            viol = 0.0
+                            diag, history = dict(EMPTY_DIAGNOSTICS, violation=0.0), []
                         else:
                             try:
-                                tr, te = evaluate(
+                                tr, te, diag, history = evaluate(
                                     p_data, p_B, p_names, target,
                                     features, cfg, seed)
                             except Exception as exc:
                                 print(f"  [WARN] seed={seed} {struct}/{target} "
                                       f"{label}/{method} failed: {exc}")
                                 tr = te = float("nan")
-                            viol = fit_violation(p_data, p_B, p_names, target,
-                                                 features, cfg, seed)
+                                diag, history = dict(EMPTY_DIAGNOSTICS), []
+                        id_cols = {"seed": seed, "structure": struct,
+                                  "target": target, "network": label,
+                                  "method": method}
+                        history_records.extend({**id_cols, **h} for h in history)
                         records.append({
-                            "seed": seed, "structure": struct, "target": target,
-                            "network": label, "method": method,
+                            **id_cols,
                             "features": fs, "train_error": tr, "test_error": te,
-                            "violation": viol,
+                            **diag,
                         })
                         print(f"  seed={seed} {struct:8s} T={target} "
                               f"{label:14s} {method:10s} "
-                              f"train={tr:.4f} test={te:.4f} viol={viol:.4f}")
+                              f"train={tr:.4f} test={te:.4f} viol={diag['violation']:.4f} "
+                              f"trip={diag['n_triplets']} best_ep={diag['best_epoch']}"
+                              f"/{diag['n_epochs_run']} dual_max={diag['dual_max']:.2f} "
+                              f"sat={diag['n_duals_saturated']}")
 
     raw = pd.DataFrame(records)
     csv_path = Path(f"{args.out}.csv")
     raw.to_csv(csv_path, index=False)
+
+    # Full per-epoch trace behind the last-epoch snapshot in `raw`: one row
+    # per (seed, structure, target, network, method, epoch). Unconstrained
+    # methods' entries only have {'epoch', 'selection_loss'}; pandas fills the
+    # constrained-only columns (dual_mean, ...) with NaN for those rows.
+    history_csv_path = Path(f"{args.out}_history.csv")
+    pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
 
     # ---- headline: avg over seeds/structures/targets, rows=network, cols=method
     def by_method(val):
@@ -291,8 +313,11 @@ def main():
 
     print("\n==== Test error by method (avg over seeds/structures/targets) ====")
     print(bm_test.to_string())
+    print("\n==== Constraint violation by method (avg over seeds/structures/targets) ====")
+    print(bm_viol.to_string())
     print(f"\nWrote {csv_path.resolve()}")
     print(f"Wrote {xlsx_path.resolve()}  (bold = best method per network)")
+    print(f"Wrote {history_csv_path.resolve()}  (full per-epoch trace)")
 
 
 if __name__ == "__main__":
