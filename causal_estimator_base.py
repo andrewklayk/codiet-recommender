@@ -52,6 +52,33 @@ class CausalConstrainedPredictor(BaseEstimator):
         n_epochs     (int,   default 50)   training epochs
         batch_size   (int,   default 32)   mini-batch size
         learning_rate(float, default 1e-3) Adam learning rate
+        val_fraction (float, default 0.0)  opt-in: fraction of the training
+            data held out (once, before the DataLoader/constraints_fn/dual are
+            built) and used ONLY for the per-epoch best_epoch_ selection score
+            -- never for gradient steps, constraints-function calibration, or
+            the ALM dual update, which all keep operating on the remaining
+            training split exactly as before. 0.0 (default) selects on the
+            training split itself, as before. Off by default so existing
+            configs keep behaving exactly as before.
+
+            Why this matters: without it, an unconstrained model selects
+            purely on training loss (which keeps improving as it overfits),
+            while a constrained model selects on training loss PLUS the
+            (ALM-driven, shrinking) violation term -- two different signals,
+            so comparing con_* against uncon_* conflates "the causal
+            constraint helps generalization" with "the violation term
+            happened to nudge the selected epoch earlier." Setting
+            val_fraction > 0 puts both arms' best_epoch_ selection on the same
+            footing: held-out predictive loss.
+
+            Known limitation: the split happens AFTER _prepare_features/
+            _prepare_target's own fitting (StandardScaler stats, target
+            mean/std for the continuous estimator), so those statistics are
+            still computed over train+val combined, not train-only -- a
+            small leak of feature/target *scale* (not labels) into the
+            validation split. Splitting cleanly would need those hooks to
+            support a separate fit-on-train/transform-on-val step; not worth
+            the extra interface surface unless it turns out to matter.
 
     Feature-restriction baseline (read from cfg):
         restrict_to_parents (bool, default False) when True, the model is fed
@@ -112,9 +139,13 @@ class CausalConstrainedPredictor(BaseEstimator):
         alm_selection_weight (float, default 1.0) weight on the mean constraint
             violation when picking the best epoch under constrained training;
             the selection score is _selection_loss(...) + alm_selection_weight *
-            mean_violation, with the violation measured on the full training set
-            (the same evaluation used for the dual update). Plain training uses
-            _selection_loss(...) alone.
+            mean_violation. The violation term is always measured on the full
+            TRAINING split (the same evaluation used for the dual update,
+            unaffected by val_fraction) -- constraint satisfaction isn't a
+            generalization question the way predictive loss is. Only the
+            _selection_loss(...) part switches to the held-out validation
+            split when val_fraction > 0. Plain training uses _selection_loss(...)
+            alone (also on the validation split when val_fraction > 0).
 
     Moreau-envelope hyper-parameters (read from cfg; moreau_mu / moreau_beta
     apply to BOTH the use_moreau=True arm and the use_alm=True arm, which wraps
@@ -163,6 +194,16 @@ class CausalConstrainedPredictor(BaseEstimator):
             slack used in this fit() call: per-triplet when calibrate_slacks
             was on and the constraints function supports it, else the plain
             cfg.alm_slack scalar broadcast; None when unconstrained.
+        n_val_            (int) number of samples held out for best_epoch_
+            selection (0 when val_fraction is 0 -- selection then reused the
+            training split itself, as before).
+        true_train_loss_  (float) the kept model's _selection_loss on the
+            actual TRAINING rows (X_t/y_t, excluding any val_fraction
+            held-out rows) -- same units as train_history_'s
+            'selection_loss', so compare it against that (the validation
+            loss, when val_fraction > 0), NOT against the accuracy-/
+            score_normalizer-based train_error/test_error/shift reported by
+            test_all_networks*.py.
     """
 
     def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
@@ -274,11 +315,15 @@ class CausalConstrainedPredictor(BaseEstimator):
         raise NotImplementedError
 
     def _selection_loss(self, model, X_t, y_t):
-        """Full-train score used to pick the best epoch (lower is better).
+        """Score used to pick the best epoch (lower is better).
 
         Default: the plain criterion value, matching plain (unconstrained)
         training's selection rule. Constrained training adds
         alm_selection_weight * mean_violation on top of this in fit() itself.
+
+        Called on the training split when cfg.val_fraction is 0 (default), or
+        the held-out validation split when it's > 0 -- either way, whatever
+        fit() passes as X_t/y_t here (see val_fraction in the class docstring).
         """
         criterion = self._build_criterion()
         return criterion(model(X_t), y_t).item()
@@ -297,6 +342,7 @@ class CausalConstrainedPredictor(BaseEstimator):
         n_epochs      = self.cfg.get('n_epochs',      50)
         batch_size    = self.cfg.get('batch_size',    32)
         lr            = self.cfg.get('learning_rate', 1e-3)
+        val_fraction  = self.cfg.get('val_fraction',   0.0)
         use_alm       = self.cfg.get('use_alm',       False)
         alm_lr        = self.cfg.get('alm_lr',        5.0)
         alm_penalty   = self.cfg.get('alm_penalty',   1.0)
@@ -342,11 +388,36 @@ class CausalConstrainedPredictor(BaseEstimator):
         self._kept_features = kept
 
         # --- target encoding (hook) ---
-        y_t, n_outputs = self._prepare_target(y)
+        y_t_full, n_outputs = self._prepare_target(y)
 
-        # --- tensors & dataloader (features restricted to self._feature_mask) ---
-        X_sel = self._select_features(np.asarray(X), fitting=True)
+        # --- tensors (features restricted to self._feature_mask) ---
+        X_sel_full = self._select_features(np.asarray(X), fitting=True)
+
+        # --- opt-in held-out split for best_epoch_ selection (val_fraction) ---
+        # Split BEFORE anything else is built, so the DataLoader, constraints
+        # function (and its collider-margin / slack calibration), and the
+        # ALM's full-train dual update all keep operating on the TRAINING
+        # split only, exactly as before -- X_t/y_t below still mean "the data
+        # this fit() call trains on". X_val_t/y_val_t are used ONLY for the
+        # epoch-selection score below; see val_fraction in the class docstring
+        # for why this needs to be a genuine held-out split rather than
+        # reusing X_t/y_t for that too.
+        n_samples = X_sel_full.shape[0]
+        if val_fraction > 0 and n_samples > 1:
+            n_val = min(n_samples - 1, max(1, int(round(n_samples * val_fraction))))
+            perm = torch.randperm(n_samples).numpy()
+            val_idx, train_idx = perm[:n_val], perm[n_val:]
+        else:
+            n_val = 0
+            train_idx = np.arange(n_samples)
+            val_idx = train_idx  # no split: selection reuses the training data
+
+        X_sel = X_sel_full[train_idx]
+        y_t = y_t_full[train_idx]
         X_t = torch.tensor(X_sel, dtype=torch.float32)
+        X_val_t = torch.tensor(X_sel_full[val_idx], dtype=torch.float32)
+        y_val_t = y_t_full[val_idx]
+
         loader = DataLoader(TensorDataset(X_t, y_t),
                             batch_size=batch_size, shuffle=True)
 
@@ -368,7 +439,13 @@ class CausalConstrainedPredictor(BaseEstimator):
                 # all remain (the target plus the retained features).
                 allowed = set(kept) | {self.target_col}
                 triplets = filter_triplets(triplets, allowed)
-            constraints_fn = self._build_constraints_fn(triplets, kept, X_sel, y_t)
+            # X_sel_full/y_t_full (not the train-only split), since this hook
+            # may infer structural facts (e.g. category cardinality) that the
+            # model needs to handle ANY row it's later evaluated on, including
+            # the held-out validation split and eventual test data -- sizing
+            # it off a shrunk training-only split risks under-counting a
+            # category that only appears in the split-out rows.
+            constraints_fn = self._build_constraints_fn(triplets, kept, X_sel_full, y_t_full)
         self._constraints_fn_ = constraints_fn
 
         # Calibrate collider hinge margins from the achievable dependence in the
@@ -409,7 +486,10 @@ class CausalConstrainedPredictor(BaseEstimator):
                                 self.cfg.get('n_constraints', 1))
 
         # --- build network (hook) ---
-        model = self._build_model(n_features, n_outputs, X_sel)
+        # X_sel_full, same reasoning as _build_constraints_fn above: the
+        # network's architecture (e.g. embedding table sizes) must fit every
+        # row it will ever see, not just the training-only split.
+        model = self._build_model(n_features, n_outputs, X_sel_full)
         criterion = self._build_criterion()
 
         # --- optimiser (plain, Moreau-only, or ALM-wrapped) ---
@@ -440,17 +520,21 @@ class CausalConstrainedPredictor(BaseEstimator):
 
         # --- training loop ---
         # We keep the *best* model seen during training rather than the last
-        # one: after each epoch the model's full-train selection score is
-        # evaluated (no_grad) and the parameters with the lowest score are
-        # cached. _selection_loss is used as the selection criterion for both
-        # the plain and the constrained variants because it is the underlying
-        # prediction objective and is comparable across epochs (unlike the
-        # Lagrangian, whose value shifts as the dual variables update).
-        # Constrained training selects on _selection_loss + sel_weight * mean
-        # violation so the returned epoch is not the one that fits the data
-        # hardest while breaking the causal facts. A fixed sel_weight (rather
-        # than the shifting dual variables) keeps the score comparable across
-        # epochs; plain training falls back to _selection_loss alone.
+        # one: after each epoch the model's selection score is evaluated
+        # (no_grad, on X_val_t/y_val_t -- the held-out split when
+        # val_fraction > 0, else the training split itself) and the
+        # parameters with the lowest score are cached. _selection_loss is
+        # used as the selection criterion for both the plain and the
+        # constrained variants because it is the underlying prediction
+        # objective and is comparable across epochs (unlike the Lagrangian,
+        # whose value shifts as the dual variables update). Constrained
+        # training selects on _selection_loss + sel_weight * mean violation
+        # (violation always measured on the training split -- see
+        # val_fraction in the class docstring) so the returned epoch is not
+        # the one that fits the data hardest while breaking the causal facts.
+        # A fixed sel_weight (rather than the shifting dual variables) keeps
+        # the score comparable across epochs; plain training falls back to
+        # _selection_loss alone.
         sel_weight = self.cfg.get('alm_selection_weight', 1.0)
         constrained = dual is not None and self._constraints_fn_ is not None
         best_score = float('inf')
@@ -483,11 +567,12 @@ class CausalConstrainedPredictor(BaseEstimator):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # --- per-epoch: full-train violation drives BOTH the dual update
-            #     and the best-epoch selection score ---
+            # --- per-epoch: full-train violation drives the dual update;
+            #     the (held-out, when val_fraction > 0) predictive score
+            #     drives best-epoch selection ---
             model.eval()
             with torch.no_grad():
-                score = self._selection_loss(model, X_t, y_t)
+                score = self._selection_loss(model, X_val_t, y_val_t)
                 entry = {'epoch': epoch, 'selection_loss': score}
                 if constrained:
                     c_full = self._constraints_fn_(model, X_t)   # full-train
@@ -524,6 +609,17 @@ class CausalConstrainedPredictor(BaseEstimator):
         self.best_epoch_ = best_epoch
         self.n_epochs_run_ = n_epochs
         self.alm_slack_ = alm_slack_use if constrained else None
+        self.n_val_ = n_val
+        # The kept (best_state) model's loss on the rows it actually trained
+        # on (X_t/y_t -- the training split, excluding val_fraction's
+        # held-out rows) in the SAME units as train_history_'s
+        # 'selection_loss' (whatever _selection_loss returns: cross-entropy
+        # for discrete, MSE for continuous) -- NOT the same units as the
+        # accuracy-/score_normalizer-based train_error reported elsewhere, so
+        # compare it against selection_loss (the validation loss when
+        # val_fraction > 0), not against train_error/test_error/shift.
+        with torch.no_grad():
+            self.true_train_loss_ = self._selection_loss(model, X_t, y_t)
         return self
 
     # ------------------------------------------------------------------

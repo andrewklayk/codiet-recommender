@@ -187,6 +187,7 @@ EMPTY_DIAGNOSTICS = {
     "best_epoch": -1, "n_epochs_run": 0,
     "dual_mean": float("nan"), "dual_max": float("nan"),
     "n_duals_saturated": 0,
+    "true_train_loss": float("nan"), "val_loss": float("nan"),
 }
 
 
@@ -209,6 +210,7 @@ def diagnostics_from_model(model, X):
         "violation_collider": _bt("collider"),
         "best_epoch": int(getattr(model, "best_epoch_", -1)),
         "n_epochs_run": int(getattr(model, "n_epochs_run_", 0)),
+        "true_train_loss": float(getattr(model, "true_train_loss_", float("nan"))),
     })
     history = getattr(model, "train_history_", None)
     if history:
@@ -216,6 +218,13 @@ def diagnostics_from_model(model, X):
         out["dual_mean"] = float(last.get("dual_mean", float("nan")))
         out["dual_max"] = float(last.get("dual_max", float("nan")))
         out["n_duals_saturated"] = int(last.get("n_duals_saturated", 0))
+        # The score that actually picked best_epoch_ -- held-out validation
+        # loss when val_fraction > 0, else the training loss itself (see
+        # true_train_loss_ in CausalConstrainedPredictor.fit's docstring for
+        # why these two are the pair to compare, not train_error/test_error).
+        best_epoch = int(getattr(model, "best_epoch_", -1))
+        if 0 <= best_epoch < len(history):
+            out["val_loss"] = float(history[best_epoch].get("selection_loss", float("nan")))
     return out
 
 
@@ -255,6 +264,8 @@ def _aggregate_fold_diagnostics(per_fold):
         "dual_mean": _mean("dual_mean"),
         "dual_max": _max("dual_max"),
         "n_duals_saturated": int(sum(d["n_duals_saturated"] for d in per_fold)),
+        "true_train_loss": _mean("true_train_loss"),
+        "val_loss": _mean("val_loss"),
     }
 
 

@@ -23,6 +23,11 @@ n_layers: 2
 n_epochs: 50
 batch_size: 32
 learning_rate: 0.001
+# opt-in: fraction of the training data held out (once, before fitting)
+# purely for best_epoch_ selection -- see CausalConstrainedPredictor.fit's
+# docstring (val_fraction) and CONSTRAINTS.md sec. 6. 0.0 (default) keeps
+# selecting on the training split itself, as before.
+val_fraction: 0.0
 
 # interaction-graph baselines: restrict the model's input features.
 #   restrict_to_parents:        keep only the target's direct causes (parents)
@@ -45,8 +50,8 @@ alm_momentum: 0.
 # opt-in: replace the single global alm_slack above with a per-triplet slack
 # calibrated from each triplet's achievable (true-label) violation floor --
 # see CausalConstrainedPredictor.fit's docstring and calibrate_slacks.ipynb.
-calibrate_slacks: false
-slack_calibration_fraction: 1.2
+calibrate_slacks: true
+slack_calibration_fraction: 1.3
 
 
 # Moreau-envelope smoothing: the ALM optimizer wraps Adam in the SAME

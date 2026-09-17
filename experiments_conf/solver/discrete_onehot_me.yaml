@@ -18,6 +18,11 @@ dropout: 0.1
 n_epochs: 50
 batch_size: 32
 learning_rate: 0.001
+# opt-in: fraction of the training data held out (once, before fitting)
+# purely for best_epoch_ selection -- see CausalConstrainedPredictor.fit's
+# docstring (val_fraction) and CONSTRAINTS.md sec. 6. 0.0 (default) keeps
+# selecting on the training split itself, as before.
+val_fraction: 0.0
 
 # Moreau-envelope smoothing ALONE, no ALM duals/constraints: isolates the
 # effect of the optimizer from the effect of the causal constraints (use_alm
