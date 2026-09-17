@@ -53,6 +53,8 @@ alm_momentum: 0.
 calibrate_slacks: true
 slack_calibration_fraction: 1.3
 
+alm_selection_weight: 0.0
+
 
 # Moreau-envelope smoothing: the ALM optimizer wraps Adam in the SAME
 # MoreauEnvelope as the *_me sibling, so uncon_ME is a valid control for this
