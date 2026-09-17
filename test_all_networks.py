@@ -135,7 +135,7 @@ SETTINGS = [
 #    ("uncon_ME",  "me",    "none"),
 #    ("uncon_parents", "uncon", "parents"),
 #    ("con_parents",   "con",   "parents"),
-    ("uncon_mb",  "uncon", "markov_blanket"),
+    # ("uncon_mb",  "uncon", "markov_blanket"),
     # ("con_mb",    "con",   "markov_blanket"),
 ]
 SETTING_ORDER = [s[0] for s in SETTINGS]
