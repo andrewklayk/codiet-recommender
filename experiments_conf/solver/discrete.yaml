@@ -20,7 +20,7 @@ n_layers: 2
 # dim_feedforward: 64 # transformer
 
 # training
-n_epochs: 30
+n_epochs: 60
 batch_size: 32
 learning_rate: 0.001
 # opt-in: fraction of the training data held out (once, before fitting)
