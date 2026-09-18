@@ -16,13 +16,13 @@ dropout: 0.1
 
 # training
 n_epochs: 30
-batch_size: 32
-learning_rate: 0.001
+batch_size: 64
+learning_rate: 0.005
 # opt-in: fraction of the training data held out (once, before fitting)
 # purely for best_epoch_ selection -- see CausalConstrainedPredictor.fit's
 # docstring (val_fraction) and CONSTRAINTS.md sec. 6. 0.0 (default) keeps
 # selecting on the training split itself, as before.
-val_fraction: 0.2
+val_fraction: 0.
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 # set use_alm: true and wire up constraints_fn in code to activate

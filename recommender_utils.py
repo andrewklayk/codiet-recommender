@@ -194,11 +194,18 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
         best_features = full_feats
         w_est = model._w_est
 
+    scoring_fn = (lambda estimator, X, y: compute_predictor_errors_and_cs_scikit(estimator, X, y, estimator._w_est)) if isinstance(model, HCRecommenderPredictor) else _scorer
+
     results = cross_validate(model, X_selected, y,
         cv=n_runs,
-        scoring=(lambda estimator, X, y: compute_predictor_errors_and_cs_scikit(estimator, X, y, estimator._w_est)) if isinstance(model, HCRecommenderPredictor) else _scorer,
+        scoring=scoring_fn,
         return_train_score=True,
-        return_estimator=return_estimators,
+        # Always requested internally (independent of return_estimators, which
+        # only controls whether estimators are handed back to THIS function's
+        # caller): both are needed below to recompute train_mse on the rows
+        # each fold's model actually trained on.
+        return_estimator=True,
+        return_indices=True,
     )
 
     if model_name == 'HC':
@@ -208,7 +215,38 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
         torch.save(model._rf_model_.state_dict(), "model.pt")
     test_mse_fold = results["test_score"]
     test_mse = test_mse_fold.mean() / score_normalizer
-    train_mse_fold = results["train_score"]
+
+    if isinstance(model, HCRecommenderPredictor):
+        # HC's scorer returns a {'score', 'c'} dict (handled specially by
+        # cross_validate above, see the train_c/test_c fallback below) and
+        # this estimator family has no train/val split concept -- keep
+        # sklearn's own train_score untouched rather than recomputing it.
+        train_mse_fold = results["train_score"]
+    else:
+        # Train error, scored ONLY on the rows each fold's model actually
+        # trained its gradients on -- NOT sklearn's own train_score, which
+        # scores the model against the fold's WHOLE assigned training
+        # partition. CausalConstrainedPredictor.fit() (the discrete/continuous
+        # estimators) can carve an internal held-out split out of that
+        # partition (cfg.val_fraction), used only to pick best_epoch_; sklearn
+        # has no visibility into that split, so its train_score would silently
+        # include rows the model was never fit on -- specifically, rows it was
+        # selected to perform well ON, which pulls train_score toward
+        # test-like values and understates any train-test comparison built on
+        # it (e.g. shift = test_error - train_error). _train_row_mask_ (set by
+        # CausalConstrainedPredictor.fit(), aligned to whatever X that call
+        # received) excludes those rows here; models without the attribute
+        # (XGB/REG, or val_fraction=0) fall back to scoring the whole fold,
+        # identical to sklearn's own train_score.
+        y_arr = np.asarray(y)
+        train_scores = []
+        for est, idx in zip(results["estimator"], results["indices"]["train"]):
+            X_fold_train, y_fold_train = X_selected[idx], y_arr[idx]
+            mask = getattr(est, "_train_row_mask_", None)
+            if mask is not None:
+                X_fold_train, y_fold_train = X_fold_train[mask], y_fold_train[mask]
+            train_scores.append(scoring_fn(est, X_fold_train, y_fold_train))
+        train_mse_fold = np.array(train_scores)
     train_mse = train_mse_fold.mean() / score_normalizer
 
     if 'train_c' not in results:
@@ -221,8 +259,14 @@ def run_feature_selection_scikit(prep_data, model_name, custom_objective,
         # The actual n_runs fold-fitted estimators, in fold order -- lets a
         # caller inspect what really produced train_mse/test_mse (e.g. each
         # fold's own train_history_) instead of only the aggregate scores.
+        # results["indices"] (also always requested above) gives each fold's
+        # {"train": ..., "test": ...} row positions into X_selected/y, so a
+        # caller can restrict any other post-hoc metric (e.g.
+        # constraint_violation) to exactly that fold's test rows, or its true
+        # training rows (via the paired estimator's own _train_row_mask_),
+        # instead of scoring over the whole dataset regardless of split.
         # Appended, not inserted, so existing fixed-arity unpacks elsewhere
         # (run_experiments.py, recommender.py) are unaffected when this stays
         # False (the default).
-        ret = ret + (results["estimator"],)
+        ret = ret + (results["estimator"], results["indices"])
     return ret

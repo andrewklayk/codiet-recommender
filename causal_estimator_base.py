@@ -197,13 +197,15 @@ class CausalConstrainedPredictor(BaseEstimator):
         n_val_            (int) number of samples held out for best_epoch_
             selection (0 when val_fraction is 0 -- selection then reused the
             training split itself, as before).
-        true_train_loss_  (float) the kept model's _selection_loss on the
-            actual TRAINING rows (X_t/y_t, excluding any val_fraction
-            held-out rows) -- same units as train_history_'s
-            'selection_loss', so compare it against that (the validation
-            loss, when val_fraction > 0), NOT against the accuracy-/
-            score_normalizer-based train_error/test_error/shift reported by
-            test_all_networks*.py.
+        _train_row_mask_  (bool ndarray, len == the X this fit() call
+            received) True for rows actually used for gradient training,
+            False for any val_fraction held-out rows (all-True when
+            val_fraction is 0). Not a "diagnostic" to read directly --
+            consumed by run_feature_selection_scikit to score train_error
+            only on the rows this model actually trained on, rather than on
+            the whole cross-validation fold (which would otherwise silently
+            include the held-out rows and understate any train-test
+            comparison, e.g. shift = test_error - train_error).
     """
 
     def __init__(self, w_est, target_col, row_and_col_names, custom_objective,
@@ -412,6 +414,15 @@ class CausalConstrainedPredictor(BaseEstimator):
             train_idx = np.arange(n_samples)
             val_idx = train_idx  # no split: selection reuses the training data
 
+        # Exposed so a caller scoring THIS SAME X (e.g. run_feature_selection_
+        # scikit's per-fold train_error, right after cross_validate hands back
+        # the exact X[train_idx] this fit() call received) can restrict to the
+        # rows actually used for gradient training, rather than scoring the
+        # whole fold including the val_fraction rows above. All-True (a no-op
+        # when applied) whenever val_fraction is 0.
+        self._train_row_mask_ = np.zeros(n_samples, dtype=bool)
+        self._train_row_mask_[train_idx] = True
+
         X_sel = X_sel_full[train_idx]
         y_t = y_t_full[train_idx]
         X_t = torch.tensor(X_sel, dtype=torch.float32)
@@ -610,16 +621,6 @@ class CausalConstrainedPredictor(BaseEstimator):
         self.n_epochs_run_ = n_epochs
         self.alm_slack_ = alm_slack_use if constrained else None
         self.n_val_ = n_val
-        # The kept (best_state) model's loss on the rows it actually trained
-        # on (X_t/y_t -- the training split, excluding val_fraction's
-        # held-out rows) in the SAME units as train_history_'s
-        # 'selection_loss' (whatever _selection_loss returns: cross-entropy
-        # for discrete, MSE for continuous) -- NOT the same units as the
-        # accuracy-/score_normalizer-based train_error reported elsewhere, so
-        # compare it against selection_loss (the validation loss when
-        # val_fraction > 0), not against train_error/test_error/shift.
-        with torch.no_grad():
-            self.true_train_loss_ = self._selection_loss(model, X_t, y_t)
         return self
 
     # ------------------------------------------------------------------

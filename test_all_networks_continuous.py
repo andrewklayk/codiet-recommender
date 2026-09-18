@@ -40,16 +40,16 @@ generated er_graph datasets. Results are written to:
     <out>.xlsx  — sheet 'summary_overall' : avg over seeds AND features, one row
                                             per backbone, the five settings side
                                             by side for train/test error AND
-                                            constraint violation; best (lowest)
-                                            per metric bold.
+                                            test-set constraint violation; best
+                                            (lowest) per metric bold.
                   sheet 'by_feature_test' : avg test error over seeds, one row per
                                             target, five settings per backbone;
                                             best per backbone bold.
                   sheet 'by_feature_train': same for train error.
-                  sheet 'violation_overall' : avg constraint violation over
-                                            seeds & features, network x setting;
-                                            lowest per network bold.
-                  sheet 'violation_by_feature': avg violation per target.
+                  sheet 'violation_overall' : avg test-set constraint violation
+                                            over seeds & features, network x
+                                            setting; lowest per network bold.
+                  sheet 'violation_by_feature': avg test-set violation per target.
                   sheet 'raw'             : every individual run.
 
 Constraint violation measures how much each fitted model's predictions break the
@@ -57,23 +57,32 @@ causal-independence constraints implied by w_est (see
 ContinuousRecommenderPredictor.constraint_violation, via ContinuousTripletConstraintsFn);
 it is logged for every setting, constrained or not.
 
-The 'raw' sheet (and the CSV) also carries, per row: n_triplets and the
-violation_chain/violation_fork/violation_collider breakdown (one structure's
-violations can't hide in the averaged 'violation' number); best_epoch and
-n_epochs_run (best_epoch == n_epochs_run - 1 means training was still
-improving when it stopped); and, for use_alm=True settings, dual_mean/
-dual_max/n_duals_saturated. n_duals_saturated > 0 means a dual is sitting at
-the optimizer's own clamp: the direct symptom of a target whose triplets
-can't jointly be driven below alm_slack, which makes its dual ratchet
-without bound and its Σλᵀc penalty term swamp the loss (see CONSTRAINTS.md
-sec. 5).
+violation_test / violation_train restrict that computation to just a fold's
+own CV test rows, or just the rows it actually trained on (excluding any
+val_fraction held-out rows), so a gap between them -- constraint satisfaction
+in-sample vs. whether it generalizes to unseen data -- is visible directly.
+The summary sheets and the console printout use violation_test as the
+headline number, for the same reason test_error (not train_error) is the
+headline accuracy metric.
+
+The 'raw' sheet (and the CSV) also carries, per row: n_triplets and, for each
+of violation_test/violation_train, its own chain/fork/collider breakdown (one
+structure's violations can't hide in the averaged total -- a target's
+colliders can be satisfiable while its forks aren't, or vice versa);
+best_epoch and n_epochs_run (best_epoch == n_epochs_run - 1 means training
+was still improving when it stopped); and, for use_alm=True settings,
+dual_mean/dual_max/n_duals_saturated. n_duals_saturated > 0 means a dual is
+sitting at the optimizer's own clamp: the direct symptom of a target whose
+triplets can't jointly be driven below alm_slack, which makes its dual
+ratchet without bound and its Σλᵀc penalty term swamp the loss (see
+CONSTRAINTS.md sec. 5).
 
 ALL of these diagnostics are aggregated over the SAME solver_cfg.n_runs
 cross-validation folds that produced train_error/test_error, NOT a separate
 model fit on 100% of the data -- a target's fold models can range from
 perfectly converged to fully collapsed (most inits fine, one fold's dual
 runs away and wrecks that fold's fit), and a lone bystander model tells you
-nothing about which happened to the folds actually being scored. violation/
+nothing about which happened to the folds actually being scored.
 violation_*/dual_mean/best_epoch are averaged across folds; dual_max/
 n_duals_saturated take the worst fold's max/sum instead, so one collapsed
 fold isn't averaged away by four fine ones. See evaluate()'s docstring and
@@ -174,43 +183,48 @@ def load_solver(name, n_epochs=None, n_runs=None):
 # Diagnostic columns every experiment script attaches to each row, on top of
 # train/test error: constraint violation broken down by causal structure (a
 # target's colliders can be satisfiable while its forks aren't, or vice versa
-# -- averaging them into one "violation" number hides that), how many
-# triplets that breakdown is over, which epoch fit() actually kept, and --
-# when use_alm=True -- the ALM dual variables' final state. n_duals_saturated
-# > 0 (a dual sitting at the optimizer's own clamp) is the direct symptom of
-# a constraint whose achievable violation floor sits above alm_slack: see
+# -- averaging them into one number hides that), how many triplets that
+# breakdown is over, which epoch fit() actually kept, and -- when
+# use_alm=True -- the ALM dual variables' final state. n_duals_saturated > 0
+# (a dual sitting at the optimizer's own clamp) is the direct symptom of a
+# constraint whose achievable violation floor sits above alm_slack: see
 # CONSTRAINTS.md sec. 5 for the worked example this was built to catch.
 EMPTY_DIAGNOSTICS = {
-    "violation": float("nan"), "n_triplets": 0,
-    "violation_chain": float("nan"), "violation_fork": float("nan"),
-    "violation_collider": float("nan"),
+    "n_triplets": 0,
+    # violation_test/violation_train (set in evaluate(), not here -- they
+    # need per-fold row indices this dict has no access to) restrict
+    # constraint_violation() to just a fold's CV test rows, or just its true
+    # training rows, each with its own chain/fork/collider breakdown so one
+    # structure's violations can't hide inside the total.
+    "violation_test": float("nan"), "violation_train": float("nan"),
+    "violation_test_chain": float("nan"), "violation_test_fork": float("nan"),
+    "violation_test_collider": float("nan"),
+    "violation_train_chain": float("nan"), "violation_train_fork": float("nan"),
+    "violation_train_collider": float("nan"),
     "best_epoch": -1, "n_epochs_run": 0,
     "dual_mean": float("nan"), "dual_max": float("nan"),
     "n_duals_saturated": 0,
-    "true_train_loss": float("nan"), "val_loss": float("nan"),
 }
 
 
-def diagnostics_from_model(model, X):
-    """Pull every post-hoc diagnostic off an already-fitted model into one
-    dict (see EMPTY_DIAGNOSTICS for the field list / rationale)."""
-    cv = model.constraint_violation(X)
-    by_type = cv["by_type"]
+def _by_type(cv, key):
+    """Pull one chain/fork/collider entry out of a constraint_violation()
+    result's by_type dict, NaN if that type has no triplets for this target."""
+    v = cv["by_type"].get(key, pd.NA)
+    return float("nan") if v is pd.NA else float(v)
 
-    def _bt(key):
-        v = by_type.get(key, pd.NA)
-        return float("nan") if v is pd.NA else float(v)
 
+def diagnostics_from_model(model):
+    """Pull every post-hoc, model-native diagnostic off an already-fitted
+    model into one dict (see EMPTY_DIAGNOSTICS for the field list /
+    rationale). violation_train/violation_test and their chain/fork/collider
+    breakdowns are NOT set here -- they need per-fold row indices this
+    function has no access to; evaluate() fills them in from its own
+    constraint_violation() calls on each fold's train/test rows."""
     out = dict(EMPTY_DIAGNOSTICS)
     out.update({
-        "violation": float(cv["total"]),
-        "n_triplets": int(cv["n_triplets"]),
-        "violation_chain": _bt("chain"),
-        "violation_fork": _bt("fork"),
-        "violation_collider": _bt("collider"),
         "best_epoch": int(getattr(model, "best_epoch_", -1)),
         "n_epochs_run": int(getattr(model, "n_epochs_run_", 0)),
-        "true_train_loss": float(getattr(model, "true_train_loss_", float("nan"))),
     })
     history = getattr(model, "train_history_", None)
     if history:
@@ -218,23 +232,16 @@ def diagnostics_from_model(model, X):
         out["dual_mean"] = float(last.get("dual_mean", float("nan")))
         out["dual_max"] = float(last.get("dual_max", float("nan")))
         out["n_duals_saturated"] = int(last.get("n_duals_saturated", 0))
-        # The score that actually picked best_epoch_ -- held-out validation
-        # loss when val_fraction > 0, else the training loss itself (see
-        # true_train_loss_ in CausalConstrainedPredictor.fit's docstring for
-        # why these two are the pair to compare, not train_error/test_error).
-        best_epoch = int(getattr(model, "best_epoch_", -1))
-        if 0 <= best_epoch < len(history):
-            out["val_loss"] = float(history[best_epoch].get("selection_loss", float("nan")))
     return out
 
 
 def _aggregate_fold_diagnostics(per_fold):
     """Combine one diagnostics_from_model() dict per CV fold into one row.
 
-    violation/violation_*/dual_mean/best_epoch: mean across folds (typical
-    behaviour). dual_max/n_duals_saturated: max/sum across folds instead of
-    mean -- a single collapsed fold (see CONSTRAINTS.md sec. 5/6: most inits
-    can converge cleanly while one fold's dual runs away) would otherwise be
+    violation_*/dual_mean/best_epoch: mean across folds (typical behaviour).
+    dual_max/n_duals_saturated: max/sum across folds instead of mean -- a
+    single collapsed fold (see CONSTRAINTS.md sec. 5/6: most inits can
+    converge cleanly while one fold's dual runs away) would otherwise be
     averaged down to near-invisible by four fine folds. n_triplets/
     n_epochs_run are structural (same graph/config for every fold), so just
     read off the first fold rather than averaged.
@@ -254,18 +261,20 @@ def _aggregate_fold_diagnostics(per_fold):
         return float(np.max(vals)) if vals else float("nan")
 
     return {
-        "violation": _mean("violation"),
         "n_triplets": int(per_fold[0]["n_triplets"]),
-        "violation_chain": _mean("violation_chain"),
-        "violation_fork": _mean("violation_fork"),
-        "violation_collider": _mean("violation_collider"),
+        "violation_test": _mean("violation_test"),
+        "violation_train": _mean("violation_train"),
+        "violation_test_chain": _mean("violation_test_chain"),
+        "violation_test_fork": _mean("violation_test_fork"),
+        "violation_test_collider": _mean("violation_test_collider"),
+        "violation_train_chain": _mean("violation_train_chain"),
+        "violation_train_fork": _mean("violation_train_fork"),
+        "violation_train_collider": _mean("violation_train_collider"),
         "best_epoch": _mean("best_epoch"),
         "n_epochs_run": int(per_fold[0]["n_epochs_run"]),
         "dual_mean": _mean("dual_mean"),
         "dual_max": _max("dual_max"),
         "n_duals_saturated": int(sum(d["n_duals_saturated"] for d in per_fold)),
-        "true_train_loss": _mean("true_train_loss"),
-        "val_loss": _mean("val_loss"),
     }
 
 
@@ -288,7 +297,7 @@ def evaluate(prep_data, w_est, row_and_col_names, target, features, solver_cfg, 
     """
     torch.manual_seed(seed)  # reproducible network init/training per seed
     (_best, train_err, test_err,
-     *_rest, estimators) = run_feature_selection_scikit(
+     *_rest, estimators, indices) = run_feature_selection_scikit(
         prep_data.copy(),
         solver_cfg.model_name,
         solver_cfg.custom_objective,
@@ -302,7 +311,37 @@ def evaluate(prep_data, w_est, row_and_col_names, target, features, solver_cfg, 
     )
 
     X_full = prep_data[features]
-    per_fold = [diagnostics_from_model(est, X_full) for est in estimators]
+    per_fold = []
+    for est, tr_idx, te_idx in zip(estimators, indices["train"], indices["test"]):
+        d = diagnostics_from_model(est)
+        # violation_test/violation_train: constraint_violation() restricted
+        # to this fold's own CV test rows / true training rows, via the
+        # positional indices run_feature_selection_scikit's
+        # cross_validate(return_indices=True) hands back -- these index into
+        # X_selected there, which is the SAME row order as X_full here as
+        # long as neither of that function's two dropna calls drops a
+        # row/column for this dataset (true for the synthetic er_graph data
+        # this script uses; would silently misalign otherwise).
+        # _train_row_mask_ further excludes any val_fraction held-out rows
+        # from "true training rows", same as the train_error fix.
+        X_test_fold = X_full.iloc[te_idx]
+        cv_test = est.constraint_violation(X_test_fold)
+        d["violation_test"] = float(cv_test["total"])
+        d["violation_test_chain"] = _by_type(cv_test, "chain")
+        d["violation_test_fork"] = _by_type(cv_test, "fork")
+        d["violation_test_collider"] = _by_type(cv_test, "collider")
+        d["n_triplets"] = int(cv_test["n_triplets"])
+
+        X_train_fold = X_full.iloc[tr_idx]
+        mask = getattr(est, "_train_row_mask_", None)
+        if mask is not None:
+            X_train_fold = X_train_fold.iloc[mask]
+        cv_train = est.constraint_violation(X_train_fold)
+        d["violation_train"] = float(cv_train["total"])
+        d["violation_train_chain"] = _by_type(cv_train, "chain")
+        d["violation_train_fork"] = _by_type(cv_train, "fork")
+        d["violation_train_collider"] = _by_type(cv_train, "collider")
+        per_fold.append(d)
     history = [{"fold": i, **h} for i, est in enumerate(estimators)
               for h in getattr(est, "train_history_", [])]
     diag = _aggregate_fold_diagnostics(per_fold)
@@ -428,7 +467,9 @@ def main():
                         **diag,
                     })
                     print(f"  seed={seed} {target:>3s} {label:14s} {setting:9s} "
-                          f"train={tr:.4f} test={te:.4f} viol={diag['violation']:.4f} "
+                          f"train={tr:.4f} test={te:.4f} "
+                          f"viol_tr={diag['violation_train']:.4f} "
+                          f"viol_te={diag['violation_test']:.4f} "
                           f"trip={diag['n_triplets']} best_ep={diag['best_epoch']}"
                           f"/{diag['n_epochs_run']} dual_max={diag['dual_max']:.2f} "
                           f"sat={diag['n_duals_saturated']}")
@@ -455,9 +496,11 @@ def main():
     # ---- overall summary: avg over seeds AND features ----
     # ('violation' is a third metric block alongside train/test so constraint
     # satisfaction is visible in the same headline table, not only in the
-    # dedicated violation_overall/violation_by_feature sheets below)
+    # dedicated violation_overall/violation_by_feature sheets below; sourced
+    # from violation_test -- whether constraint satisfaction generalizes --
+    # for the same reason the headline error metric is test, not train)
     metric_cols = {"train": "train_error", "test": "test_error",
-                   "violation": "violation"}
+                   "violation": "violation_test"}
     o = raw.groupby(["network", "setting"])[list(metric_cols.values())].mean()
     overall = pd.DataFrame(index=net_labels)
     overall.index.name = "network"
@@ -470,8 +513,9 @@ def main():
                       [f"{s}_test" for s in SETTING_ORDER],
                       [f"{s}_violation" for s in SETTING_ORDER]]
 
-    # ---- constraint-violation summaries (avg over seeds) ----
-    gv = raw.groupby(["network", "setting", "target"])["violation"].mean()
+    # ---- constraint-violation summaries (avg over seeds); test-set, since
+    # that's what says whether constraint satisfaction generalizes ----
+    gv = raw.groupby(["network", "setting", "target"])["violation_test"].mean()
     viol_by_feat = pd.DataFrame(index=targets_sorted)
     viol_by_feat.index.name = "feature"
     viol_feat_groups = []
@@ -484,7 +528,7 @@ def main():
         viol_feat_groups.append(cols)
     viol_by_feat = viol_by_feat.round(4)
 
-    ov = raw.groupby(["network", "setting"])["violation"].mean()
+    ov = raw.groupby(["network", "setting"])["violation_test"].mean()
     viol_overall = pd.DataFrame(index=net_labels)
     viol_overall.index.name = "network"
     for setting in SETTING_ORDER:
@@ -510,7 +554,7 @@ def main():
 
     print("\n==== Overall test error (avg over seeds & features; lower is better) ====")
     print(overall[[f"{s}_test" for s in SETTING_ORDER]].to_string())
-    print("\n==== Overall constraint violation (avg over seeds & features; lower is better) ====")
+    print("\n==== Overall test-set constraint violation (avg over seeds & features; lower is better) ====")
     print(overall[[f"{s}_violation" for s in SETTING_ORDER]].to_string())
     print(f"\nWrote {csv_path.resolve()}")
     print(f"Wrote {xlsx_path.resolve()}  (bold = best of the five settings)")

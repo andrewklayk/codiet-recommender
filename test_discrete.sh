@@ -10,4 +10,4 @@ set -euo pipefail
 ml PyTorch/2.10.0-foss-2025b-CUDA-12.9.1
 source .venv/bin/activate
 
-python3 -u test_all_networks.py --n-seeds 5 --networks mlp,deep_mlp --n-epochs 30
+python3 -u test_all_networks.py --n-seeds 5 --networks mlp,deep_mlp --n-epochs 50

@@ -16,13 +16,13 @@ dropout: 0.1
 
 # training
 n_epochs: 30
-batch_size: 32
-learning_rate: 0.001
+batch_size: 64
+learning_rate: 0.005
 # opt-in: fraction of the training data held out (once, before fitting)
 # purely for best_epoch_ selection -- see CausalConstrainedPredictor.fit's
 # docstring (val_fraction) and CONSTRAINTS.md sec. 6. 0.0 (default) keeps
 # selecting on the training split itself, as before.
-val_fraction: 0.2
+val_fraction: 0.
 
 # constrained training via humancompatible/train (pip install humancompatible-train)
 use_alm: true
@@ -39,7 +39,7 @@ alm_momentum: 0.
 # calibrated from each triplet's achievable (true-label) violation floor --
 # see CausalConstrainedPredictor.fit's docstring and calibrate_slacks.ipynb.
 calibrate_slacks: true
-slack_calibration_fraction: 1.5
+slack_calibration_fraction: 1.2
 # 0.0: best_epoch_ selects on held-out predictive loss ALONE, matching
 # uncon_all's criterion exactly (it has no violation term to begin with) --
 # isolates "does constrained training reach a better achievable unseen

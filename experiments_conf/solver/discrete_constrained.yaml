@@ -27,7 +27,7 @@ learning_rate: 0.001
 # purely for best_epoch_ selection -- see CausalConstrainedPredictor.fit's
 # docstring (val_fraction) and CONSTRAINTS.md sec. 6. 0.0 (default) keeps
 # selecting on the training split itself, as before.
-val_fraction: 0.2
+val_fraction: 0.
 
 # interaction-graph baselines: restrict the model's input features.
 #   restrict_to_parents:        keep only the target's direct causes (parents)
@@ -51,8 +51,7 @@ alm_momentum: 0.
 # calibrated from each triplet's achievable (true-label) violation floor --
 # see CausalConstrainedPredictor.fit's docstring and calibrate_slacks.ipynb.
 calibrate_slacks: true
-slack_calibration_fraction: 1.5
-
+slack_calibration_fraction: 1.2
 alm_selection_weight: 0.0
 
 
